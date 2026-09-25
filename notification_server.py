@@ -137,30 +137,3 @@ if __name__ == "__main__":
     # threaded=True is the default; stated here because it's why we need _lock
     app.run(host="localhost", port=PORT, threaded=True)
  
-# tests: 
-
-"""
-run the server with:
-python notification_server.py
-
-
-in another terminal test with curl to say user 2 likeed user 1's post:
-
-curl -X POST localhost:5004/notifications -H "Content-Type: application/json" -H "X-Request-ID: abc" -d '{"to_user_id":1,"type":"like","from_user_id":2,"post_id":1}'
-
-check user one's notifications:
-
-curl localhost:5004/notifications/1
-
-
-user 2 comments on user 1's post:
-
-curl -X POST localhost:5004/notifications -H "Content-Type: application/json" -H "X-Request-ID: xyz" -d '{"to_user_id":1,"type":"comment","from_user_id":2,"post_id":1}'
-
-
-
-
-curl localhost:5004/notifications/1
-
-
-"""
