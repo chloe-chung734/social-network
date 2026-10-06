@@ -8,28 +8,9 @@ import requests
 NOTIFICATION_SERVER_URL = "http://127.0.0.1:8003/notifications"
 
 
-# Create the Flask application
 app = Flask(__name__)
 
 
-# Represents a comment on a post
-class Comment:
-    def __init__(self, comment_id, author, content):
-        self.id = comment_id
-        self.author = author
-        self.content = content
-
-    # Converts the Comment object into a dictionary
-    # so it can be returned as JSON
-    def to_dict(self):
-        return {
-            "id": self.id,
-            "author": self.author,
-            "content": self.content
-        }
-
-
-# Represents a social media post
 class Post:
     def __init__(self, post_id, author, timestamp, content, caption):
         self.id = post_id
@@ -38,14 +19,12 @@ class Post:
         self.content = content
         self.caption = caption
 
-        # Stores the IDs of users who liked this post
+        # Stores user IDs who liked this post
         self.likes = []
 
         # Stores Comment objects belonging to this post
         self.comments = []
 
-    # Converts the Post object into a dictionary
-    # so it can be returned as JSON
     def to_dict(self):
         return {
             "id": self.id,
@@ -54,8 +33,6 @@ class Post:
             "content": self.content,
             "caption": self.caption,
             "likes": self.likes,
-
-            # Convert every Comment object into a dictionary
             "comments": [
                 comment.to_dict()
                 for comment in self.comments
@@ -63,26 +40,44 @@ class Post:
         }
 
 
-# Temporary in-memory storage for posts
-# The posts will disappear when the server restarts
+class Comment:
+    def __init__(self, comment_id, author, content):
+        self.id = comment_id
+        self.author = author
+        self.content = content
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "author": self.author,
+            "content": self.content
+        }
+
+
+# Temporary in-memory storage.
+# This can later be replaced with database repository functions.
 posts = {}
 
-
-# Used to give each new post a unique ID
 next_post_id = 1
+next_comment_id = 1
 
 
-# This function runs when the client sends a POST request
-# to http://127.0.0.1:8001/posts/create
 @app.post("/posts/create")
 def create_post():
     global next_post_id
 
     try:
-        # Read the JSON data sent by the client
-        data = request.get_json()
+        data = request.get_json(silent=True) or {}
 
-        # Create a new Post object
+        required_fields = ["author", "content", "caption"]
+
+        for field in required_fields:
+            if field not in data:
+                return jsonify({
+                    "success": False,
+                    "error": f"Missing required field: {field}"
+                }), 400
+
         post = Post(
             post_id=next_post_id,
             author=data["author"],
@@ -91,14 +86,11 @@ def create_post():
             caption=data["caption"]
         )
 
-        # Store the post
         posts[post.id] = post
         next_post_id += 1
 
-        # Notify the Notification Server
         notification_sent = notify_notification_server(post)
 
-        # Send a success response
         return jsonify({
             "success": True,
             "post": post.to_dict(),
@@ -106,46 +98,187 @@ def create_post():
         }), 201
 
     except Exception as error:
-        # Send a failure response if post creation fails
         return jsonify({
             "success": False,
             "error": str(error)
         }), 400
 
 
-# This route receives a request from the Feed Server
-# asking for all posts made by a specific author
 @app.post("/posts/retrieve")
 def retrieve_posts():
     try:
-        # Read the JSON message from the Feed Server
-        data = request.get_json()
+        data = request.get_json(silent=True) or {}
 
-        # Get the author whose posts are being requested
+        if "author" not in data:
+            return jsonify({
+                "success": False,
+                "error": "Missing required field: author"
+            }), 400
+
         requested_author = data["author"]
 
-        # Find every post belonging to that author
         author_posts = [
             post.to_dict()
             for post in posts.values()
             if post.author == requested_author
         ]
 
-        # Return the posts to the Feed Server
         return jsonify({
             "success": True,
             "posts": author_posts
         }), 200
 
     except Exception as error:
-        # Return a failure response if retrieval fails
         return jsonify({
             "success": False,
             "error": str(error)
         }), 400
 
+
+@app.post("/posts/<int:post_id>/comments")
+def create_comment(post_id):
+    global next_comment_id
+
+    post = posts.get(post_id)
+
+    if post is None:
+        return jsonify({
+            "success": False,
+            "error": "Post not found"
+        }), 404
+
+    data = request.get_json(silent=True) or {}
+
+    author = data.get("author")
+    content = data.get("content")
+
+    if not author or not content:
+        return jsonify({
+            "success": False,
+            "error": "author and content are required"
+        }), 400
+
+    comment = Comment(
+        comment_id=next_comment_id,
+        author=author,
+        content=content
+    )
+
+    post.comments.append(comment)
+    next_comment_id += 1
+
+    return jsonify({
+        "success": True,
+        "comment": comment.to_dict(),
+        "post": post.to_dict()
+    }), 201
+
+
+@app.delete("/posts/<int:post_id>")
+def delete_post(post_id):
+    post = posts.get(post_id)
+
+    if post is None:
+        return jsonify({
+            "success": False,
+            "error": "Post not found"
+        }), 404
+
+    deleted_post = post.to_dict()
+
+    del posts[post_id]
+
+    return jsonify({
+        "success": True,
+        "deleted_post": deleted_post
+    }), 200
+
+
+@app.delete("/posts/<int:post_id>/comments/<int:comment_id>")
+def delete_comment(post_id, comment_id):
+    post = posts.get(post_id)
+
+    if post is None:
+        return jsonify({
+            "success": False,
+            "error": "Post not found"
+        }), 404
+
+    comment_to_delete = None
+
+    for comment in post.comments:
+        if comment.id == comment_id:
+            comment_to_delete = comment
+            break
+
+    if comment_to_delete is None:
+        return jsonify({
+            "success": False,
+            "error": "Comment not found"
+        }), 404
+
+    deleted_comment = comment_to_delete.to_dict()
+
+    post.comments.remove(comment_to_delete)
+
+    return jsonify({
+        "success": True,
+        "deleted_comment": deleted_comment,
+        "post": post.to_dict()
+    }), 200
+
+
+@app.post("/posts/<int:post_id>/likes/<string:user_id>")
+def like_post(post_id, user_id):
+    post = posts.get(post_id)
+
+    if post is None:
+        return jsonify({
+            "success": False,
+            "error": "Post not found"
+        }), 404
+
+    if user_id in post.likes:
+        return jsonify({
+            "success": False,
+            "error": "User has already liked this post"
+        }), 409
+
+    post.likes.append(user_id)
+
+    return jsonify({
+        "success": True,
+        "message": "Post liked successfully",
+        "post": post.to_dict()
+    }), 201
+
+
+@app.delete("/posts/<int:post_id>/likes/<string:user_id>")
+def unlike_post(post_id, user_id):
+    post = posts.get(post_id)
+
+    if post is None:
+        return jsonify({
+            "success": False,
+            "error": "Post not found"
+        }), 404
+
+    if user_id not in post.likes:
+        return jsonify({
+            "success": False,
+            "error": "User has not liked this post"
+        }), 404
+
+    post.likes.remove(user_id)
+
+    return jsonify({
+        "success": True,
+        "message": "Like deleted successfully",
+        "post": post.to_dict()
+    }), 200
+
+
 def notify_notification_server(post):
-    # Message sent to the Notification Server
     notification_message = {
         "type": "new_post",
         "post_id": post.id,
@@ -154,26 +287,21 @@ def notify_notification_server(post):
     }
 
     try:
-        # Send the message to the Notification Server
         response = requests.post(
             NOTIFICATION_SERVER_URL,
             json=notification_message,
             timeout=5
         )
 
-        # Raise an error if the Notification Server returns
-        # a failure status code
         response.raise_for_status()
 
         return True
 
     except requests.RequestException as error:
-        # The post was already created, so just report that
-        # notification delivery failed
         print(f"Notification failed: {error}")
         return False
 
-# Start the Flask server when this file is run directly
+
 if __name__ == "__main__":
     app.run(
         host="127.0.0.1",
