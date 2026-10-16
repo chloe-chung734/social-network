@@ -167,6 +167,19 @@ def get_following(user_id):
     log_json("JSON marshalled response", body, request.headers.get("X-Request-ID", "-"))
     return jsonify(body), 200
 
+@app.get("/profiles/<int:user_id>/followers")
+def get_followers(user_id):
+    """Notification's dependency: who follows this user?"""
+    with _lock:
+        # Unknown user -> 404
+        if user_id not in _profiles:
+            return jsonify({"success": False, "error": "unknown user",
+                            "user_id": user_id}), 404
+        # Check every user's following list and collect
+        # the ones whose list contains user_id
+        followers = sorted(uid for uid, targets in _following.items()
+                           if user_id in targets)
+    return jsonify({"user_id": user_id, "followers": followers}), 200
 
 @app.post("/profiles/<int:user_id>/following")
 def add_follow(user_id):
