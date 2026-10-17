@@ -179,14 +179,6 @@ With both Feed nodes running, execute:
 python group_sender.py --message-id milestone2-group-1
 ```
 
-Expected output includes the following; acknowledgement order can differ:
-
-```text
-GROUP_ACK message_id=milestone2-group-1 node=feed status=ready
-GROUP_ACK message_id=milestone2-group-1 node=feed-2 status=ready
-GROUP_SUMMARY message_id=milestone2-group-1 members=2 acknowledged=2 failed=0
-```
-
 Find `GROUP_RECEIVED` with that message ID in both `logs/feed.log` and
 `logs/feed-2.log`. These are two independent Feed processes on ports 6003 and
 6006. The sender sends the same message over a separate TCP connection to each
@@ -195,12 +187,7 @@ node and validates each acknowledgement's node name, message ID, and status.
 ### Show the message before and after marshalling
 
 Open `logs/group_sender.log` after the group test. The relevant entries have
-the following form, with timestamps omitted:
-
-```text
-BEFORE_MARSHAL {'type': 'demo_status_request', 'group': 'service_nodes', 'message_id': 'milestone2-group-1'}
-AFTER_MARSHAL b'{"type": "demo_status_request", "group": "service_nodes", "message_id": "milestone2-group-1"}\n'
-```
+the following form, with timestamps omitted
 
 Before marshalling, the message is a Python dictionary. After marshalling, it
 is JSON encoded as UTF-8 bytes. The `b'...'` notation is Python's display of
