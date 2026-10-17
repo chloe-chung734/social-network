@@ -135,13 +135,8 @@ def read_json_object():
     return data, None
 
 
-def publish_created_event(post_dict):
-    """Publish a post.created event when event publishing is enabled."""
-    event = {
-        "event_id": str(uuid.uuid4()),
-        "type": "post.created",
-        "post": post_dict,
-    }
+def publish_event(event):
+    """Publish an event to the broker and report subscriber delivery results."""
     wire = marshal(event, "BROKER_EVENT")
     broker_url = os.getenv("BROKER_URL", DEFAULT_BROKER_URL).rstrip("/")
     request_id = str(uuid.uuid4())
@@ -154,12 +149,19 @@ def publish_created_event(post_dict):
                 "Content-Type": "application/json",
                 "X-Request-ID": request_id,
             },
-            timeout=2,
+            # Allow for the broker's retries when a subscriber is slow.
+            timeout=10,
         )
         log.info("BROKER_REPLY status=%s event_id=%s body=%s",
                  response.status_code, event["event_id"], response.text)
         response.raise_for_status()
-        return True, None
+        result = unmarshal(response.content, "BROKER_REPLY")
+        delivered = result.get("all_delivered") is True
+        if not delivered:
+            log.warning("BROKER_PARTIAL_DELIVERY event_id=%s matched=%s delivered=%s failed=%s",
+                        event["event_id"], result.get("matched"),
+                        result.get("delivered"), result.get("failed"))
+        return delivered, result
     except requests.RequestException as exc:
         # Keep the stored post even if the broker is unavailable.
         log.warning("BROKER_DELIVERY_FAILED event_id=%s error=%s",
@@ -181,8 +183,9 @@ def create_post():
     if error:
         return error
 
-    author = data.get("author")
-    content = data.get("content")
+    # Accept both client-facing and Post service field names.
+    author = data.get("user_id", data.get("author"))
+    content = data.get("image_url", data.get("content", ""))
     caption = data.get("caption")
 
     if not valid_id(author):
@@ -204,14 +207,16 @@ def create_post():
         _next_post_id += 1
         post_dict = post.to_dict()
 
-    # Enable only when a compatible broker is running.
     event_published = False
     publish_error = None
-    if os.getenv("PUBLISH_POST_EVENTS", "0") == "1":
-        event_published, publish_error = publish_created_event(post_dict)
+    if os.getenv("PUBLISH_POST_EVENTS", "1") == "1":
+        event = {"event_id": str(uuid.uuid4()), "type": "post.created",
+                 "post": post_dict}
+        event_published, publish_error = publish_event(event)
 
     reply = {
         "success": True,
+        "id": post_dict["id"],
         "post": post_dict,
         "event_published": event_published,
     }
@@ -271,8 +276,8 @@ def create_comment(post_id):
     if error:
         return error
 
-    author = data.get("author")
-    content = data.get("content")
+    author = data.get("user_id", data.get("author"))
+    content = data.get("text", data.get("content"))
     if not valid_id(author):
         return error_response("author must be a positive integer", 400)
     if not isinstance(content, str) or not content:
@@ -290,7 +295,19 @@ def create_comment(post_id):
         }
         _next_comment_id += 1
         post.comments.append(comment)
-        reply = {"success": True, "comment": comment, "post": post.to_dict()}
+        post_dict = post.to_dict()
+        reply = {"success": True, "comment": comment, "post": post_dict}
+
+    if os.getenv("PUBLISH_POST_EVENTS", "1") == "1":
+        event = {"event_id": str(uuid.uuid4()), "type": "post.commented",
+                 "post_id": post_id, "post_author": post_dict["author"],
+                 "user_id": author}
+        delivered, result = publish_event(event)
+        reply["event_published"] = delivered
+        if isinstance(result, dict):
+            reply["event_delivery"] = result
+        elif result:
+            reply["event_publish_error"] = result
 
     return jsonify(reply), 201
 
@@ -320,6 +337,7 @@ def delete_comment(post_id, comment_id):
 
 
 @app.post("/posts/<int:post_id>/likes")
+@app.post("/posts/<int:post_id>/like")
 def like_post(post_id):
     """Like a post with a JSON body such as {"user_id": 2}."""
     data, error = read_json_object()
@@ -338,11 +356,23 @@ def like_post(post_id):
             return error_response("User has already liked this post", 409)
 
         post.likes.append(user_id)
+        post_dict = post.to_dict()
         reply = {
             "success": True,
             "message": "Post liked successfully",
-            "post": post.to_dict(),
+            "post": post_dict,
         }
+
+    if os.getenv("PUBLISH_POST_EVENTS", "1") == "1":
+        event = {"event_id": str(uuid.uuid4()), "type": "post.liked",
+                 "post_id": post_id, "post_author": post_dict["author"],
+                 "user_id": user_id}
+        delivered, result = publish_event(event)
+        reply["event_published"] = delivered
+        if isinstance(result, dict):
+            reply["event_delivery"] = result
+        elif result:
+            reply["event_publish_error"] = result
 
     return jsonify(reply), 201
 
@@ -378,8 +408,10 @@ def unlike_post(post_id):
 if __name__ == "__main__":
     # This host works for local testing. For other computers, use a reachable
     # interface such as 0.0.0.0 and configure the firewall as needed.
-    server = make_server("127.0.0.1", 8001, app, threaded=True)
-    log.info("HTTP_LISTEN 127.0.0.1:8001")
+    host = os.getenv("POST_HOST", "127.0.0.1")
+    port = int(os.getenv("POST_PORT", "5002"))
+    server = make_server(host, port, app, threaded=True)
+    log.info("HTTP_LISTEN %s:%s", host, port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
