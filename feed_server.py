@@ -6,7 +6,7 @@ REQUEST-REPLY
 The client requests GET /feed/<user_id> on HTTP port 5003.
 Feed gets the user's following list from the Profile service on port 5001
 using GET /profiles/<user_id>/following. It then requests each followed
-author's posts from the Post service on port 8001 using POST /posts/retrieve.
+author's posts from the Post service on port 5002 using POST /posts/retrieve.
 Feed validates the posts, removes duplicate post IDs, and returns them
 in order from newest to oldest.
 
@@ -244,7 +244,7 @@ class FeedServer:
 
 
 def create_app(profile_url="http://127.0.0.1:5001",
-               post_url="http://127.0.0.1:8001", log_dir="logs", timeout=2,
+               post_url="http://127.0.0.1:5002", log_dir="logs", timeout=2,
                demo_following=None, node_name="feed"):
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024
@@ -366,7 +366,7 @@ if __name__ == "__main__":
     parser.add_argument("--demo-following", action="append", type=parse_demo_following,
                         help="TEST ONLY: USER:AUTHOR,AUTHOR, e.g. 2:7,9; repeat for other users")
     parser.add_argument("--profile-url", default="http://127.0.0.1:5001")
-    parser.add_argument("--post-url", default="http://127.0.0.1:8001")
+    parser.add_argument("--post-url", default="http://127.0.0.1:5002")
     parser.add_argument("--broker-url", help="Optional broker supporting POST /subscribe")
     parser.add_argument("--callback-url", help="URL the broker uses to reach this node's /events")
     args = parser.parse_args()
