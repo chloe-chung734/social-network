@@ -1,60 +1,68 @@
-"""Feed service for CECS 327 Milestone 2. Python 3.10+.
+"""
+Feed service for CECS 327 Milestone 2.
+Requires Python 3.10+, Flask, and requests.
+
+REQUEST-REPLY
+The client requests GET /feed/<user_id> on HTTP port 5003.
+Feed gets the user's following list from the Profile service on port 5001
+using GET /profiles/<user_id>/following. It then requests each followed
+author's posts from the Post service on port 8001 using POST /posts/retrieve.
+Feed validates the posts, removes duplicate post IDs, and returns them
+in order from newest to oldest.
+
+PUBLISH-SUBSCRIBE
+When started with --broker-url, Feed subscribes to the post.created topic
+through the broker's /subscribe endpoint. The broker forwards matching
+events to Feed's POST /events endpoint.
+
+Feed validates incoming events, records them in memory, and recognizes
+duplicate deliveries using event_id. Displayed feeds are built from fresh
+Post service requests; the stored events are separate from feed retrieval.
+
+GROUP COMMUNICATION
+Feed also runs a TCP group receiver on port 6003 by default.
+group_sender.py sends the same status request and message ID to multiple
+Feed nodes in the service_nodes group.
+
+Each node receives newline-terminated JSON, validates it, logs its receipt,
+and returns an acknowledgement containing its node name, the original
+message_id, and status "ready". This confirms the group receiver responded.
+
+SERIALIZATION AND LOGGING
+Messages are marshalled from Python dictionaries into UTF-8 JSON bytes
+and unmarshalled back into Python data when received.
+UTC timestamped logs show requests, replies, events, group messages,
+and data before and after marshalling and unmarshalling.
+Logs appear in the terminal and logs/<node-name>.log.
 
 INSTALL AND START
+Install dependencies:
     python -m pip install flask requests
-    python feed_server.py
-    python client.py feed 2                 # in a different terminal
 
-The client's GET /feed/<user_id> is served on HTTP port 5003. The existing
-Post service runs on 8001 and accepts POST /posts/retrieve with {"author": 7}.
-Start Post with: python post_server.py
+Start Profile and Post in their own terminals. For pub-sub, also start
+the broker before starting Feed with:
+    python feed_server.py --broker-url http://127.0.0.1:5005
 
-MISSING PROFILE INTERFACE
-Your uploaded Profile file does not yet supply a following list. Agree on:
-    GET /profiles/2/following -> {"user_id": 2, "following": [7, 9]}
-User IDs at this boundary must be positive integers, matching client.py.
-Until that endpoint exists, explicitly enable a TEST-ONLY following map:
-    python feed_server.py --demo-following 2:7,9
-This means user 2 follows authors 7 and 9; repeat the flag for other users.
-Use --demo-following 5: for a user who follows nobody. No Profile request is
-made in demo mode. The response and logs label this test data as demo data.
-Actual posts are still retrieved from your running Post service.
+Request a feed from another terminal:
+    python client.py feed 2
 
-PUB-SUB CONTRACT (PROPOSED; NO BROKER WAS UPLOADED)
-Feed registers with POST <broker>/subscribe:
-    {"topic": "post.created", "url": "http://127.0.0.1:5003/events"}
-The broker replies {"success": true}, and sends matching events to POST /events:
-    {"event_id": "unique-1", "type": "post.created", "post": {
-        "id": 1, "author": 7, "timestamp": "2026-10-13T02:00:00Z",
-        "content": "photo.jpg", "caption": "Hello", "likes": [], "comments": []}}
-Start with --broker-url http://127.0.0.1:5005 when a compatible broker exists.
-Use --callback-url if the broker needs another address to reach Feed.
-The actual Post service must publish events, and a second service must subscribe
-to demonstrate the TEAM's complete pub-sub requirement. An HTTP callback alone
-does not demonstrate pub-sub. The current Notification endpoint has a different
-message format; its teammate must implement a subscriber/adapter.
+GROUP DEMO
+With the first Feed node running, start a second node in another terminal:
+    python feed_server.py --port 5006 --group-port 6006 --node-name feed-2
 
-TCP GROUP CONTRACT
-Feed receives one newline-terminated JSON message per connection on TCP 6003:
-    {"type": "demo_status_request", "group": "service_nodes", "message_id": "g1"}
-It logs and acknowledges the message. A group sender must send the same ID to
-multiple nodes; this file implements the receiver side. To start a second Feed
-node for testing: python feed_server.py --port 5006 --group-port 6006 --node-name feed-2
-Group membership is configured by the sender. There is no total-order or atomic
-group-delivery guarantee. This uses explicit TCP sockets, not RPC or RMI.
+Then run the sender in another terminal:
+    python group_sender.py --message-id group-demo-1
 
-LOGS AND LIMITS
-UTC logs go to logs/feed.log (or logs/<node-name>.log). They include request IDs,
-events, group messages, and data BEFORE/AFTER marshalling and unmarshalling.
-The event collection is in memory and is lost on restart. It is NOT the source
-of displayed feeds: each GET retrieves fresh data from Post, including deletions.
-Restart Feed to register again after a broker restart. Dependencies have a
-two-second timeout per call, not a two-second overall feed deadline. For many
-followed users, the client's three-second timeout may need to increase.
-An empty feed is HTTP 200; dependency failure is 502, timeout is 504. No silent
-fallback to fake data or incomplete feeds. This is a local teaching prototype
-without user authentication, a database connection, or durable event delivery.
-Use /health to check the process only; it does not check other services.
+Compare the matching message IDs and acknowledgements in both node logs
+and logs/group_sender.log.
+
+IMPLEMENTATION NOTES
+Event records and duplicate tracking are lost when Feed restarts.
+Restart Feed to subscribe again after a broker restart.
+The --demo-following option is available for testing; normal operation
+gets following lists from Profile.
+The /health endpoint checks only the Feed process.
+Group delivery has no automatic retries or all-or-nothing guarantee.
 """
 
 import argparse
