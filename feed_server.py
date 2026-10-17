@@ -112,7 +112,7 @@ class ServiceError(Exception):
         self.status = status
 
 
-def request_json(method, url, logger, request_id, body=None, timeout=2):
+def request_json(method, url, logger, request_id, body=None, timeout=2, not_found_error=None):
     """Call another service. Explicit serialization makes the wire format clear."""
     headers = {"Content-Type": "application/json", "X-Request-ID": request_id}
     wire = None if body is None else marshal(body, logger, request_id)
@@ -121,6 +121,13 @@ def request_json(method, url, logger, request_id, body=None, timeout=2):
         response = requests.request(method, url, data=wire, headers=headers,
                                     timeout=timeout)
         logger.info("RECV status=%s request_id=%s", response.status_code, request_id)
+        if response.status_code == 404 and not_found_error is not None:
+            error_body = unmarshal(response.content, logger, request_id)
+
+            if (isinstance(error_body, dict)
+                    and error_body.get("error") == not_found_error):
+                raise ServiceError(not_found_error, 404)
+
         response.raise_for_status()
         result = unmarshal(response.content, logger, request_id)
     except requests.Timeout as error:
