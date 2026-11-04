@@ -177,8 +177,8 @@ def ensure_demo_profile(user_id, username):
 def require_delivery(result, step, minimum):
     """Check the actual broker report, including the number of recipients."""
     require_success(result, step)
-    # Current Post uses event_publish_error for the create-post delivery report,
-    # even on success. Likes/comments put the report in event_delivery instead.
+    # Post puts the broker report in event_delivery. Older Post versions used
+    # event_publish_error, so that field is still accepted.
     report = result.get("event_delivery")
     if not isinstance(report, dict):
         report = result.get("event_publish_error")
@@ -217,7 +217,7 @@ def run_demo(author_id=10, follower_id=11):
     require_success(follow(bob_id, alice_id), "Follow Alice")
 
     log.info("--- Step 3: Alice creates a post (Post -> Broker -> subscribers) ---")
-    result = require_success(create_post(alice_id, "Milestone 2 demo post!",
+    result = require_success(create_post(alice_id, "Milestone 3 demo post!",
                                         "images/sunset.jpg"), "Create post")
     post = result.get("post")
     if not isinstance(post, dict) or type(post.get("id")) is not int or post["id"] <= 0:
