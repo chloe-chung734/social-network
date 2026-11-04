@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -18,7 +19,11 @@ from chord_client import ChordClient, ChordError, ChordTimeout, ChordUnavailable
 DEFAULT_BROKER_URL = "http://127.0.0.1:5005"
 AUTHOR_BUDGET_SECONDS = 7.0
 _client = ChordClient()
-_comment_id = 1
+# Every read-modify-write of Chord records (ID counter, author index, likes,
+# comments) runs under this lock. Flask is threaded, and without it two
+# requests can read the same counter or post and overwrite each other.
+# This assumes ONE Post process, as chord_contract.md does.
+_write_lock = threading.Lock()
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024
@@ -164,32 +169,32 @@ def create_post():
     if not isinstance(content, str) or not isinstance(caption, str):
         return error_response("content and caption must be strings", 400)
 
-    try:
-        counter_id = "meta:next_post_id"
-        counter = load_record(counter_id)
-        post_id = counter.get("value", 1) if isinstance(counter, dict) else 1
-        if not valid_id(post_id):
-            raise ChordUnavailable("invalid post ID counter")
-        save_record(counter_id, {"value": post_id + 1}, "counter")
-        post = {"id": post_id, "author": author,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "content": content, "caption": caption,
-                "likes": [], "comments": []}
-        save_record("post:%d" % post_id, post, "post")
+    with _write_lock:
         try:
-            index = get_author_index(author)
-            index["post_ids"] = sorted(set(index["post_ids"] + [post_id]))
-            save_record("author:%d" % author, index, "author-index")
-        except ChordError:
-            # Best-effort compensation; the ID remains consumed.
+            counter_id = "meta:next_post_id"
+            counter = load_record(counter_id)
+            post_id = counter.get("value", 1) if isinstance(counter, dict) else 1
+            if not valid_id(post_id):
+                raise ChordUnavailable("invalid post ID counter")
+            save_record(counter_id, {"value": post_id + 1}, "counter")
+            post = {"id": post_id, "author": author,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "content": content, "caption": caption,
+                    "likes": [], "comments": []}
+            save_record("post:%d" % post_id, post, "post")
             try:
-                delete_record("post:%d" % post_id, "compensate-post")
+                index = get_author_index(author)
+                index["post_ids"] = sorted(set(index["post_ids"] + [post_id]))
+                save_record("author:%d" % author, index, "author-index")
             except ChordError:
-                pass
-            raise
-    except ChordError as exc:
-        return storage_error(exc)
-
+                # Best-effort compensation; the ID remains consumed.
+                try:
+                    delete_record("post:%d" % post_id, "compensate-post")
+                except ChordError:
+                    pass
+                raise
+        except ChordError as exc:
+            return storage_error(exc)
     reply = {"success": True, "id": post_id, "post": post,
              "event_published": False}
     if os.getenv("PUBLISH_POST_EVENTS", "1") == "1":
@@ -232,22 +237,22 @@ def retrieve_posts():
 
 @app.delete("/posts/<int:post_id>")
 def delete_post(post_id):
-    try:
-        post = get_post(post_id)
-        if post is None:
-            return error_response("Post not found", 404)
-        delete_record("post:%d" % post_id, "delete-post")
-        index = get_author_index(post["author"])
-        index["post_ids"] = [item for item in index["post_ids"] if item != post_id]
-        save_record("author:%d" % post["author"], index, "delete-index")
-    except ChordError as exc:
-        return storage_error(exc)
+    with _write_lock:
+        try:
+            post = get_post(post_id)
+            if post is None:
+                return error_response("Post not found", 404)
+            delete_record("post:%d" % post_id, "delete-post")
+            index = get_author_index(post["author"])
+            index["post_ids"] = [item for item in index["post_ids"] if item != post_id]
+            save_record("author:%d" % post["author"], index, "delete-index")
+        except ChordError as exc:
+            return storage_error(exc)
     return jsonify({"success": True, "deleted_post": post}), 200
 
 
 @app.post("/posts/<int:post_id>/comments")
 def create_comment(post_id):
-    global _comment_id
     data, error = read_json_object()
     if error:
         return error
@@ -257,16 +262,20 @@ def create_comment(post_id):
         return error_response("author must be a positive integer", 400)
     if not isinstance(content, str) or not content:
         return error_response("content must be a nonempty string", 400)
-    try:
-        post = get_post(post_id)
-        if post is None:
-            return error_response("Post not found", 404)
-        comment = {"id": _comment_id, "author": author, "content": content}
-        _comment_id += 1
-        post.setdefault("comments", []).append(comment)
-        update_post(post, "comment")
-    except ChordError as exc:
-        return storage_error(exc)
+    with _write_lock:
+        try:
+            post = get_post(post_id)
+            if post is None:
+                return error_response("Post not found", 404)
+            # Comment IDs come from the stored post, so they stay unique
+            # within the post even after Post restarts.
+            existing = post.setdefault("comments", [])
+            next_id = max((c.get("id", 0) for c in existing), default=0) + 1
+            comment = {"id": next_id, "author": author, "content": content}
+            post.setdefault("comments", []).append(comment)
+            update_post(post, "comment")
+        except ChordError as exc:
+            return storage_error(exc)
     reply = {"success": True, "comment": comment, "post": post}
     if os.getenv("PUBLISH_POST_EVENTS", "1") == "1":
         delivered, result = publish_event({"type": "post.commented",
@@ -281,18 +290,19 @@ def create_comment(post_id):
 
 @app.delete("/posts/<int:post_id>/comments/<int:comment_id>")
 def delete_comment(post_id, comment_id):
-    try:
-        post = get_post(post_id)
-        if post is None:
-            return error_response("Post not found", 404)
-        comment = next((item for item in post.get("comments", [])
-                        if item.get("id") == comment_id), None)
-        if comment is None:
-            return error_response("Comment not found", 404)
-        post["comments"].remove(comment)
-        update_post(post, "delete-comment")
-    except ChordError as exc:
-        return storage_error(exc)
+    with _write_lock:
+        try:
+            post = get_post(post_id)
+            if post is None:
+                return error_response("Post not found", 404)
+            comment = next((item for item in post.get("comments", [])
+                            if item.get("id") == comment_id), None)
+            if comment is None:
+                return error_response("Comment not found", 404)
+            post["comments"].remove(comment)
+            update_post(post, "delete-comment")
+        except ChordError as exc:
+            return storage_error(exc)
     return jsonify({"success": True, "deleted_comment": comment, "post": post}), 200
 
 
@@ -305,16 +315,17 @@ def like_post(post_id):
     user_id = data.get("user_id")
     if not valid_id(user_id):
         return error_response("user_id must be a positive integer", 400)
-    try:
-        post = get_post(post_id)
-        if post is None:
-            return error_response("Post not found", 404)
-        if user_id in post.get("likes", []):
-            return error_response("User has already liked this post", 409)
-        post.setdefault("likes", []).append(user_id)
-        update_post(post, "like")
-    except ChordError as exc:
-        return storage_error(exc)
+    with _write_lock:
+        try:
+            post = get_post(post_id)
+            if post is None:
+                return error_response("Post not found", 404)
+            if user_id in post.get("likes", []):
+                return error_response("User has already liked this post", 409)
+            post.setdefault("likes", []).append(user_id)
+            update_post(post, "like")
+        except ChordError as exc:
+            return storage_error(exc)
     reply = {"success": True, "message": "Post liked successfully", "post": post}
     if os.getenv("PUBLISH_POST_EVENTS", "1") == "1":
         delivered, result = publish_event({"type": "post.liked",
@@ -335,16 +346,17 @@ def unlike_post(post_id):
     user_id = data.get("user_id")
     if not valid_id(user_id):
         return error_response("user_id must be a positive integer", 400)
-    try:
-        post = get_post(post_id)
-        if post is None:
-            return error_response("Post not found", 404)
-        if user_id not in post.get("likes", []):
-            return error_response("User has not liked this post", 404)
-        post["likes"].remove(user_id)
-        update_post(post, "unlike")
-    except ChordError as exc:
-        return storage_error(exc)
+    with _write_lock:
+        try:
+            post = get_post(post_id)
+            if post is None:
+                return error_response("Post not found", 404)
+            if user_id not in post.get("likes", []):
+                return error_response("User has not liked this post", 404)
+            post["likes"].remove(user_id)
+            update_post(post, "unlike")
+        except ChordError as exc:
+            return storage_error(exc)
     return jsonify({"success": True, "message": "Like removed successfully",
                     "post": post}), 200
 
