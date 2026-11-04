@@ -69,7 +69,7 @@ Peer failures must not be translated into a successful empty author feed.
 
 - Start first peer without bootstrap; it creates a one-peer ring and becomes
   ready. Start additional peers with an existing bootstrap peer. Proposed
-  command shape: `python chord_peer.py --id ID --port PORT --db PATH` and,
+  command shape: `python chord_peer.py --id ID --port PORT --db-dir DIR` and,
   for joining peers, `--bootstrap http://HOST:PORT`. Confirm final flags with
   the peer owner before using demo scripts.
 - `POST /join` on the joining peer with `{"bootstrap_url":"..."}` returns
