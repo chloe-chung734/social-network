@@ -22,16 +22,20 @@ INTERNAL API (peer-to-peer only, used by join/leave/recovery)
     /internal/export, /internal/import, /internal/set_role, /internal/drop,
     /internal/refresh, /internal/rebackup
 
+RECORDS
+    "post:<n>", "author:<n>" and "meta:next_post_id" are all stored. Every
+    record carries a version; a delete leaves a tombstone that is copied to
+    the backup, so a delayed old copy can never overwrite or undo it.
+
 LIMITS (see the report/README)
-    * peer_storage.py currently stores only post records ("post:<id>").
-      Post's "author:<id>" and "meta:next_post_id" records are rejected with
-      HTTP 501 until the storage adapter supports them.
-    * peer_storage.py has no versions/tombstones, so a delayed stale copy can
-      overwrite a newer one, and a deleted post can come back from a backup.
     * One membership change at a time (enforced with a ring-wide pause).
+    * Tombstones are never purged (fine for a class demo).
+    * "meta:next_post_id" is read then written by Post; with ONE Post process
+      that is safe (the contract assumes one).
 """
 
 import argparse
+import hashlib
 import logging
 import sys
 import threading
@@ -89,18 +93,23 @@ def valid_key(value):
     return type(value) is int and 0 <= value < RING_SIZE
 
 
-def post_id_from(record_id):
-    """'post:7' -> 7.  Anything else -> None (storage can't hold it yet)."""
-    if isinstance(record_id, str) and record_id.startswith("post:"):
-        number = record_id[5:]
-        if number.isdigit() and int(number) > 0:
-            return int(number)
+def routing_key_for(record_id):
+    """The ring key of a record ID, or None if the ID is not one we store.
+
+    post:<n>            SHA-256 of the decimal post ID (chord_utils)
+    author:<n>          SHA-256 of the UTF-8 record ID, modulo 32 (contract)
+    meta:next_post_id   same rule as author records
+    """
+    if not isinstance(record_id, str):
+        return None
+    kind, _, rest = record_id.partition(":")
+    if kind == "post" and rest.isascii() and rest.isdigit() and int(rest) > 0:
+        return post_routing_key(int(rest))
+    if (kind == "author" and rest.isascii() and rest.isdigit() and int(rest) > 0) \
+            or record_id == "meta:next_post_id":
+        digest = hashlib.sha256(record_id.encode("utf-8")).digest()
+        return int.from_bytes(digest, "big") % RING_SIZE
     return None
-
-
-def public_post(stored):
-    """Storage rows carry routing_key and role; Post only wants the post."""
-    return {k: v for k, v in stored.items() if k not in ("routing_key", "role")}
 
 
 # The peer
@@ -410,8 +419,7 @@ class ChordPeer:
             self.call(owner, "/internal/set_predecessor", {"peer": pred}, request_id)
 
             # 5. Everything confirmed, so my local copies can go.
-            for record in self.storage.get_posts_in_interval(self.id, self.id):
-                self.storage.delete_post(record["id"])
+            self.storage.drop_interval(self.id, self.id)
 
             # 6. The remaining peers rebuild routing, then resume writes.
             with self.lock:
@@ -550,12 +558,10 @@ def health():
 @app.get("/state")
 def state():
     pred, successors, fingers, status, pause_id = PEER.snapshot()
-    records = PEER.storage.get_posts_in_interval(PEER.id, PEER.id)
     return ok(peer_id=PEER.id, url=PEER.me["url"], predecessor=pred,
               successor=successors[0], successors=successors, fingers=fingers,
               status=status, ready=status == "ready" and not pause_id,
-              records={"primary": sum(r["role"] == "primary" for r in records),
-                       "backup": sum(r["role"] == "backup" for r in records)})
+              records=PEER.storage.counts())
 
 
 @app.post("/lookup")
@@ -602,77 +608,86 @@ def check_record(data):
     record_id, key = data.get("record_id"), data.get("routing_key")
     if not valid_key(key):
         return None, None, fail("routing_key must be an integer in [0, 31]", 400)
-    post_id = post_id_from(record_id)
-    if post_id is None:
-        return None, None, fail("storage adapter only supports post:<id> records",
-                                501)
-    if post_routing_key(post_id) != key:
-        return None, None, fail("routing_key does not match the post ID hash", 400)
+    expected = routing_key_for(record_id)
+    if expected is None:
+        return None, None, fail("record_id must be post:<n>, author:<n> or "
+                                "meta:next_post_id", 400)
+    if expected != key:
+        return None, None, fail("routing_key does not match the record ID hash", 400)
     pred, successors, _, _, _ = PEER.snapshot()
     owns = successors[0]["id"] == PEER.id or \
         (pred is not None and in_open_closed(key, pred["id"], PEER.id))
     if not owns:
         return None, None, fail(f"peer {PEER.id} does not own key {key}; "
                                 "repeat the lookup", 503)
-    return post_id, key, None
+    return record_id, key, None
+
+
+def replicate(record, request_id):
+    """Send one record (live or tombstone) to my successor as its backup."""
+    successor = PEER.snapshot()[1][0]
+    PEER.call(successor, "/internal/import",
+              {"records": [record], "role": "backup"}, request_id)
+    return successor
 
 
 @app.post("/records/get")
 def records_get():
-    post_id, key, error = check_record(body())
+    record_id, key, error = check_record(body())
     if error:
         return error
-    stored = PEER.storage.get_post(post_id)
-    PEER.info("RECORD_GET", record=f"post:{post_id}", key=key, found=bool(stored))
-    if stored is None:
+    stored = PEER.storage.get(record_id)
+    found = stored is not None and not stored["deleted"]
+    PEER.info("RECORD_GET", record=record_id, key=key, found=found)
+    if not found:
         return ok(found=False)
-    return ok(found=True, record=public_post(stored))
+    return ok(found=True, record=stored["value"])
 
 
 @app.post("/records/put")
 def records_put():
     data = body()
-    post_id, key, error = check_record(data)
+    record_id, key, error = check_record(data)
     if error:
         return error
     allowed, reason = PEER.writes_allowed()
     if not allowed:
         return fail(reason, 503)
     value = data.get("value")
-    if not isinstance(value, dict) or value.get("id") != post_id:
+    if not isinstance(value, dict):
+        return fail("value must be a JSON object", 400)
+    if record_id.startswith("post:") and value.get("id") != int(record_id[5:]):
         return fail("value must be the post object with a matching id", 400)
 
-    # Primary first, then the backup on my successor.  Success only if both.
-    PEER.storage.put_post(value, key, role="primary")
-    successor = PEER.snapshot()[1][0]
+    # Primary first, then the backup on my successor. Success only if both.
+    stored = PEER.storage.put(record_id, key, value, data.get("operation_id"))
     try:
-        PEER.call(successor, "/internal/import", {"records": [
-            {**value, "routing_key": key}], "role": "backup"}, g.request_id)
+        successor = replicate(stored, g.request_id)
     except (PeerUnreachable, PeerError) as exc:
         return fail(f"primary stored but backup not confirmed: {exc}", 503)
-    PEER.info("RECORD_PUT", record=f"post:{post_id}", key=key,
+    PEER.info("RECORD_PUT", record=record_id, key=key, version=stored["version"],
               backup_on=successor["id"], operation_id=data.get("operation_id"))
-    return ok(stored=True, role="primary", backup=successor["id"])
+    return ok(stored=True, role="primary", backup=successor["id"],
+              version=stored["version"])
 
 
 @app.post("/records/delete")
 def records_delete():
     data = body()
-    post_id, key, error = check_record(data)
+    record_id, key, error = check_record(data)
     if error:
         return error
     allowed, reason = PEER.writes_allowed()
     if not allowed:
         return fail(reason, 503)
-    PEER.storage.delete_post(post_id)
-    successor = PEER.snapshot()[1][0]
+    tombstone = PEER.storage.delete(record_id, key, data.get("operation_id"))
     try:
-        PEER.call(successor, "/internal/drop_ids", {"ids": [post_id]}, g.request_id)
+        successor = replicate(tombstone, g.request_id)
     except (PeerUnreachable, PeerError) as exc:
         return fail(f"primary deleted but backup not confirmed: {exc}", 503)
-    PEER.info("RECORD_DELETE", record=f"post:{post_id}", key=key,
+    PEER.info("RECORD_DELETE", record=record_id, key=key, version=tombstone["version"],
               backup_on=successor["id"], operation_id=data.get("operation_id"))
-    return ok(deleted=True)
+    return ok(deleted=True, version=tombstone["version"])
 
 
 #internal
@@ -712,18 +727,19 @@ def internal_set_predecessor():
 @app.post("/internal/export")
 def internal_export():
     data = body()
-    rows = PEER.storage.get_posts_in_interval(data["start"], data["end"])
-    rows = [r for r in rows if r["role"] == data["role"]]
-    return ok(records=rows)
+    return ok(records=PEER.storage.list_interval(data["start"], data["end"],
+                                                 data["role"]))
 
 
 @app.post("/internal/import")
 def internal_import():
     data = body()
-    for record in data["records"]:
-        PEER.storage.put_post(record, record["routing_key"], role=data["role"])
-    PEER.info("IMPORTED", count=len(data["records"]), role=data["role"])
-    return ok(imported=len(data["records"]))
+    applied, ignored = PEER.storage.import_records(data["records"], data["role"])
+    PEER.info("IMPORTED", count=len(data["records"]), role=data["role"],
+              applied=applied, ignored=ignored)
+    # "imported" confirms every record is now safely held: applied, or we
+    # already had the same or a newer version.
+    return ok(imported=len(data["records"]), applied=applied, ignored=ignored)
 
 
 @app.post("/internal/set_role")
@@ -738,19 +754,15 @@ def internal_set_role():
 @app.post("/internal/drop")
 def internal_drop():
     data = body()
-    rows = PEER.storage.get_posts_in_interval(data["start"], data["end"])
-    dropped = [r["id"] for r in rows if r["role"] == data["role"]]
-    for post_id in dropped:
-        PEER.storage.delete_post(post_id)
+    dropped = PEER.storage.drop_interval(data["start"], data["end"], data["role"])
     PEER.info("DROPPED", interval=f"({data['start']},{data['end']}]",
-              role=data["role"], count=len(dropped))
-    return ok(dropped=len(dropped))
+              role=data["role"], count=dropped)
+    return ok(dropped=dropped)
 
 
 @app.post("/internal/drop_ids")
 def internal_drop_ids():
-    for post_id in body().get("ids", []):
-        PEER.storage.delete_post(post_id)
+    PEER.storage.drop_ids(body().get("ids", []))
     return ok()
 
 

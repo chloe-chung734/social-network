@@ -1,169 +1,212 @@
-import sqlite3
-import os
+"""Local SQLite storage for ONE Chord peer (Milestone 3).
+
+Each peer has its own file, <db_dir>/peer_<id>.db. Peers never share a
+database; they only exchange records over HTTP (the peer server does that).
+
+Every record has:
+    record_id    "post:<n>", "author:<n>" or "meta:next_post_id" (the identity)
+    routing_key  0..31, kept separate so two records may share a key
+    value        the JSON object Post stored (the full post for post:<n>)
+    version      owner write counter; a higher version always wins
+    deleted      1 = deletion marker (tombstone) so old copies cannot return
+    role         "primary" (this peer owns the key) or "backup"
+
+When a write counts as successful (the peer server enforces this):
+    the owner saves it here as primary AND its successor confirms saving the
+    same record (same version) as backup. This module only saves what it gets.
+
+How the peer calls this module:
+    put / delete                  owner writes (assign the next version)
+    get                           read one record (a tombstone has deleted=1)
+    list_interval                 records with keys in (start, end] for a transfer
+    import_records                save transferred or backup records (safe to repeat)
+    set_role_for_interval, drop_interval, drop_ids, promote_backups_to_primary
+"""
+
 import json
-from datetime import datetime, timezone
+import os
+import sqlite3
+from contextlib import contextmanager
+
+from chord_utils import in_open_closed
+
+TABLE = """
+CREATE TABLE IF NOT EXISTS peer_records (
+    record_id    TEXT PRIMARY KEY,
+    routing_key  INTEGER NOT NULL,
+    value_json   TEXT,
+    version      INTEGER NOT NULL,
+    deleted      INTEGER NOT NULL DEFAULT 0,
+    role         TEXT NOT NULL CHECK(role IN ('primary', 'backup')),
+    operation_id TEXT
+)
+"""
+
+
+def _record(row):
+    """One database row -> the dictionary peers send to each other."""
+    return {"record_id": row["record_id"], "routing_key": row["routing_key"],
+            "value": None if row["value_json"] is None else json.loads(row["value_json"]),
+            "version": row["version"], "deleted": bool(row["deleted"]),
+            "operation_id": row["operation_id"], "role": row["role"]}
+
 
 class PeerStorage:
-    def __init__(self, peer_id: int, db_dir: str = "database"):
-        """Initializes isolated SQLite storage for a specific Chord peer ID."""
+    def __init__(self, peer_id, db_dir="database"):
         self.peer_id = int(peer_id)
         os.makedirs(db_dir, exist_ok=True)
         self.db_path = os.path.join(db_dir, f"peer_{self.peer_id}.db")
-        self._init_db()
+        with self._write() as conn:
+            conn.execute(TABLE)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_key ON peer_records(routing_key)")
 
-    def _get_connection(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("PRAGMA foreign_keys = ON;")
+    # connections
+
+    @contextmanager
+    def _write(self):
+        """One write transaction; BEGIN IMMEDIATE stops two writers racing."""
+        conn = sqlite3.connect(self.db_path, timeout=10, isolation_level=None)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            yield conn
+            conn.execute("COMMIT")
+        except BaseException:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
 
-    def _init_db(self):
-        """Creates table separating post ID, routing key, payload, and role (primary/backup)."""
-        conn = self._get_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS peer_posts (
-                post_id INTEGER PRIMARY KEY,
-                routing_key INTEGER NOT NULL,
-                author INTEGER NOT NULL,
-                timestamp TEXT NOT NULL,
-                content TEXT NOT NULL,
-                caption TEXT DEFAULT '',
-                likes_json TEXT DEFAULT '[]',
-                comments_json TEXT DEFAULT '[]',
-                role TEXT CHECK(role IN ('primary', 'backup')) NOT NULL DEFAULT 'primary',
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_routing_key ON peer_posts(routing_key);')
-        conn.commit()
-        conn.close()
+    @contextmanager
+    def _read(self):
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
 
-    def put_post(self, post_data: dict, routing_key: int, role: str = 'primary'):
-        """Inserts or updates a post record with its routing key and storage role."""
-        conn = self._get_connection()
-        cursor = conn.cursor()
-        
-        post_id = int(post_data['id'])
-        author = int(post_data['author'])
-        timestamp = post_data.get('timestamp', datetime.now(timezone.utc).isoformat())
-        content = post_data.get('content', '')
-        caption = post_data.get('caption', '')
-        likes_json = json.dumps(post_data.get('likes', []))
-        comments_json = json.dumps(post_data.get('comments', []))
+    @staticmethod
+    def _find(conn, record_id):
+        return conn.execute("SELECT * FROM peer_records WHERE record_id = ?",
+                            (record_id,)).fetchone()
 
-        cursor.execute('''
-            INSERT INTO peer_posts 
-            (post_id, routing_key, author, timestamp, content, caption, likes_json, comments_json, role)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(post_id) DO UPDATE SET
-                routing_key = excluded.routing_key,
-                author = excluded.author,
-                timestamp = excluded.timestamp,
-                content = excluded.content,
-                caption = excluded.caption,
-                likes_json = excluded.likes_json,
-                comments_json = excluded.comments_json,
-                role = CASE WHEN peer_posts.role = 'primary' THEN 'primary' ELSE excluded.role END,
-                updated_at = CURRENT_TIMESTAMP
-        ''', (post_id, int(routing_key), author, timestamp, content, caption, likes_json, comments_json, role))
-        
-        conn.commit()
-        conn.close()
+    @staticmethod
+    def _save(conn, record_id, key, value_json, version, deleted, role, operation_id):
+        conn.execute("INSERT OR REPLACE INTO peer_records VALUES (?, ?, ?, ?, ?, ?, ?)",
+                     (record_id, int(key), value_json, int(version), int(deleted),
+                      role, operation_id))
 
-    def get_post(self, post_id: int) -> dict:
-        """Retrieves a specific post by its full integer ID."""
-        conn = self._get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM peer_posts WHERE post_id = ?", (int(post_id),))
-        row = cursor.fetchone()
-        conn.close()
-        if not row:
-            return None
-        return self._row_to_dict(row)
+    # owner writes
 
-    def delete_post(self, post_id: int):
-        """Deletes a post record locally."""
-        conn = self._get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT role FROM peer_posts WHERE post_id = ?", (int(post_id),))
-        row = cursor.fetchone()
-        if row:
-            cursor.execute("DELETE FROM peer_posts WHERE post_id = ?", (int(post_id),))
-            conn.commit()
-        conn.close()
+    def put(self, record_id, routing_key, value, operation_id=None):
+        """Owner write. New version = old + 1. The same operation_id twice is a no-op."""
+        with self._write() as conn:
+            old = self._find(conn, record_id)
+            if old is not None and operation_id is not None \
+                    and old["operation_id"] == operation_id:
+                return _record(old)
+            version = old["version"] + 1 if old is not None else 1
+            self._save(conn, record_id, routing_key, json.dumps(value), version, 0,
+                       "primary", operation_id)
+            return _record(self._find(conn, record_id))
 
-    def get_posts_in_interval(self, start: int, end: int) -> list:
+    def delete(self, record_id, routing_key, operation_id=None):
+        """Owner delete: keep a tombstone with a higher version, never just remove."""
+        with self._write() as conn:
+            old = self._find(conn, record_id)
+            if old is not None and old["deleted"] and operation_id is not None \
+                    and old["operation_id"] == operation_id:
+                return _record(old)
+            version = old["version"] + 1 if old is not None else 1
+            self._save(conn, record_id, routing_key, None, version, 1, "primary",
+                       operation_id)
+            return _record(self._find(conn, record_id))
+
+    def get(self, record_id):
+        with self._read() as conn:
+            row = self._find(conn, record_id)
+        return _record(row) if row is not None else None
+
+    # transfers and backups
+
+    def list_interval(self, start, end, role=None):
+        """Records (tombstones too) whose key is in the clockwise interval (start, end].
+
+        start == end means the whole ring; start > end wraps past zero.
         """
-        Returns all records whose routing key falls clockwise in the interval (start, end].
-        Handles 32-position ring wrap-around (e.g., start=28, end=4).
+        with self._read() as conn:
+            if role is None:
+                rows = conn.execute("SELECT * FROM peer_records ORDER BY record_id")
+            else:
+                rows = conn.execute("SELECT * FROM peer_records WHERE role = ? "
+                                    "ORDER BY record_id", (role,))
+            records = [_record(row) for row in rows.fetchall()]
+        return [r for r in records if in_open_closed(r["routing_key"], start, end)]
+
+    def import_records(self, records, role):
+        """Save transferred records. Returns (applied, ignored).
+
+        A copy is applied only if its version is newer than ours, so repeating
+        a transfer does nothing and a delayed old copy cannot overwrite a newer
+        record or bring back a deleted one. An equal-version copy sent as
+        "primary" promotes our backup (the hand-off on join and leave).
         """
-        conn = self._get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM peer_posts")
-        rows = cursor.fetchall()
-        conn.close()
+        applied = ignored = 0
+        with self._write() as conn:
+            for rec in records:
+                old = self._find(conn, rec["record_id"])
+                version = int(rec["version"])
+                value_json = None if rec.get("value") is None else json.dumps(rec["value"])
+                if old is None or version > old["version"]:
+                    keep_primary = old is not None and old["role"] == "primary"
+                    self._save(conn, rec["record_id"], rec["routing_key"], value_json,
+                               version, 1 if rec.get("deleted") else 0,
+                               "primary" if keep_primary else role,
+                               rec.get("operation_id"))
+                    applied += 1
+                elif version == old["version"] and role == "primary" \
+                        and old["role"] == "backup":
+                    conn.execute("UPDATE peer_records SET role = 'primary' "
+                                 "WHERE record_id = ?", (rec["record_id"],))
+                    applied += 1
+                else:
+                    ignored += 1
+        return applied, ignored
 
-        results = []
-        for row in rows:
-            rk = row['routing_key']
-            if self._in_interval(rk, start, end):
-                results.append(self._row_to_dict(row))
-        return results
+    def set_role_for_interval(self, start, end, role):
+        """Change the role of every record whose key is in (start, end]."""
+        ids = [r["record_id"] for r in self.list_interval(start, end)]
+        with self._write() as conn:
+            conn.executemany("UPDATE peer_records SET role = ? WHERE record_id = ?",
+                             [(role, record_id) for record_id in ids])
+        return len(ids)
 
-    def _in_interval(self, key: int, start: int, end: int) -> int:
-        """Checks if key is within (start, end] on a 32-position ring (0 to 31)."""
-        if start < end:
-            return start < key <= end
-        else: # Wrap-around case (e.g., start=28, end=4)
-            return key > start or key <= end
+    def drop_interval(self, start, end, role=None):
+        """Remove local copies in (start, end]; call only after a confirmed hand-off."""
+        ids = [r["record_id"] for r in self.list_interval(start, end, role)]
+        return self.drop_ids(ids)
+
+    def drop_ids(self, record_ids):
+        with self._write() as conn:
+            conn.executemany("DELETE FROM peer_records WHERE record_id = ?",
+                             [(record_id,) for record_id in record_ids])
+        return len(record_ids)
 
     def promote_backups_to_primary(self):
-        """Promotes all backup records to primary (used during peer failure takeover)."""
-        conn = self._get_connection()
-        cursor = conn.cursor()
-        cursor.execute("UPDATE peer_posts SET role = 'primary' WHERE role = 'backup'")
-        conn.commit()
-        conn.close()
+        """Crash takeover: the backups this peer holds become primary."""
+        with self._write() as conn:
+            return conn.execute("UPDATE peer_records SET role = 'primary' "
+                                "WHERE role = 'backup'").rowcount
 
-    def set_role_for_interval(self, start: int, end: int, role: str):
-        """Updates role ('primary' or 'backup') for posts within a given routing interval."""
-        conn = self._get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM peer_posts")
-        rows = cursor.fetchall()
-        
-        for row in rows:
-            if self._in_interval(row['routing_key'], start, end):
-                cursor.execute("UPDATE peer_posts SET role = ? WHERE post_id = ?", (role, row['post_id']))
-        conn.commit()
-        conn.close()
-
-    def _row_to_dict(self, row) -> dict:
-        return {
-            "id": row['post_id'],
-            "routing_key": row['routing_key'],
-            "author": row['author'],
-            "timestamp": row['timestamp'],
-            "content": row['content'],
-            "caption": row['caption'],
-            "likes": json.loads(row['likes_json']),
-            "comments": json.loads(row['comments_json']),
-            "role": row['role']
-        }
-
-if __name__ == "__main__":
-    storage = PeerStorage(peer_id=20)
-    sample_post = {
-        "id": 101,
-        "author": 7,
-        "timestamp": "2026-10-13T02:00:00+00:00",
-        "content": "photo17.jpg",
-        "caption": "Testing Chord storage",
-        "likes": [],
-        "comments": []
-    }
-    storage.put_post(sample_post, routing_key=17, role='primary')
-    posts_in_range = storage.get_posts_in_interval(start=12, end=20)
-    print(f"Posts found in interval (12, 20]: {len(posts_in_range)}")
-    print(posts_in_range[0])
+    def counts(self):
+        with self._read() as conn:
+            rows = conn.execute("SELECT role, deleted, COUNT(*) FROM peer_records "
+                                "GROUP BY role, deleted").fetchall()
+        result = {"primary": 0, "backup": 0, "tombstones": 0}
+        for role, deleted, count in rows:
+            result["tombstones" if deleted else role] += count
+        return result
