@@ -1,8 +1,8 @@
-"""Small HTTP client for the Part 4 Chord peer API.
+"""Small HTTP client for the Chord peer API (chord_peer.py, chord_contract.md).
 
-The peer API is not present in the inspected repository. The endpoints below
-are the explicit interface requested in api_notes.txt; confirm them with the
-peer/storage owners before using this client with their implementation.
+Post uses it to find a record's owner through one entry peer (/lookup), then
+reads or writes the record on that owner (/records/get, /records/put,
+/records/delete). Set CHORD_ENTRY_PEER to choose the entry peer.
 """
 
 import hashlib
