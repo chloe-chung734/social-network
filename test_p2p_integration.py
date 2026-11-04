@@ -172,6 +172,41 @@ class PostFeedTests(ClusterCase):
             d.placement_problems(c, created, self.ring, also_empty=[d.JOINER]), [])
 
 
+    def test_concurrent_creates_and_likes_are_not_lost(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        def create(i):
+            return requests.post(d.POST_URL + "/posts", timeout=30,
+                                 json={"author": 7, "content": f"c{i}.jpg",
+                                       "caption": f"concurrent {i}"})
+
+        with ThreadPoolExecutor(6) as pool:
+            replies = list(pool.map(create, range(6)))
+        self.assertTrue(all(r.status_code == 201 for r in replies))
+        ids = [r.json()["id"] for r in replies]
+        self.assertEqual(len(set(ids)), 6, f"duplicate post IDs: {ids}")
+
+        target = ids[0]
+        like = lambda user: requests.post(f"{d.POST_URL}/posts/{target}/likes",
+                                          json={"user_id": user}, timeout=30)
+        with ThreadPoolExecutor(6) as pool:
+            self.assertTrue(all(r.status_code == 201
+                                for r in pool.map(like, range(100, 106))))
+        stored = self.client.get(f"post:{target}", d.post_routing_key(target),
+                                 d.new_request_id("likes"))
+        self.assertEqual(sorted(stored["likes"]), list(range(100, 106)))
+
+    def test_comment_ids_are_unique_within_a_post(self):
+        created, failures = d.create_posts_via_post(self.cluster)
+        self.assertEqual(failures, [])
+        post_id = sorted(created)[0]
+        for text in ("one", "two", "three"):
+            reply = requests.post(f"{d.POST_URL}/posts/{post_id}/comments",
+                                  json={"author": 9, "content": text}, timeout=30)
+            self.assertEqual(reply.status_code, 201, reply.text)
+        ids = [c["id"] for c in reply.json()["post"]["comments"]]
+        self.assertEqual(ids, [1, 2, 3])
+
     def test_deleted_post_is_not_restored_by_join_or_leave(self):
         c = self.cluster
         created, failures = d.create_posts_via_post(c)
