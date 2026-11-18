@@ -5,6 +5,8 @@ Sends HTTP requests to the Profile, Post, Feed, and Notification servers
 and logs every request/response to the console and to logs/client.log.
 
 Uses only the Python standard library (no pip install needed).
+Milestone 4 additionally imports the team's shared message_protocol module.
+Use --post-url before the command to target a second Post instance.
 
 Usage:
     python client.py demo                          # run the full demo flow
@@ -61,19 +63,37 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("client")
+_process_context = None
+
+
+def process_context():
+    """All actions and retries in this process share Member 1's clock."""
+    global _process_context
+    if _process_context is None:
+        try:
+            from message_protocol import MessageContext
+        except ModuleNotFoundError as error:
+            if error.name != "message_protocol":
+                raise
+            if os.getenv("COORDINATION_ENABLED", "0") == "1":
+                raise RuntimeError("Milestone 4 requires Member 1's message_protocol.py") from error
+            return None
+        _process_context = MessageContext(os.getenv("NODE_NAME", "client"))
+    return _process_context
 
 
 # ---------------------------------------------------------------------------
 # Core request function
 # ---------------------------------------------------------------------------
-def send_request(service, method, path, body=None):
+def send_request(service, method, path, body=None, *, request_id=None):
     """Send a JSON request to a service and return the parsed JSON response.
 
     Request IDs correlate logs. They do not make writes idempotent: the current
     Post service does not deduplicate post/comment creation by request ID.
     """
     url = SERVICES[service].rstrip("/") + path
-    request_id = str(uuid.uuid4())
+    request_id = request_id or str(uuid.uuid4())
+    context = process_context()
     data = None
     if body is not None:
         log.info("BEFORE_MARSHAL request_id=%s message=%r", request_id, body)
@@ -83,11 +103,18 @@ def send_request(service, method, path, body=None):
     attempts = MAX_RETRIES + 1 if method == "GET" else 1
 
     for attempt in range(1, attempts + 1):
-        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        # Each retry is a new send event, but keeps the operation's correlation ID.
+        outgoing = context.send_headers(request_id, extra=headers) if context else headers
+        if context:
+            context.log("HTTP_SEND", request_id, method=method, url=url, attempt=attempt)
+        req = urllib.request.Request(url, data=data, headers=outgoing, method=method)
         log.info("SEND  -> %s-service %s %s request_id=%s", service, method,
                  path, request_id)
         try:
             with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
+                if context:
+                    context.receive_headers(resp.headers)
+                    context.log("HTTP_RECV", request_id, status=resp.status, url=url)
                 raw = resp.read()
                 log.info("BEFORE_UNMARSHAL request_id=%s wire=%r", request_id, raw)
                 result = json.loads(raw.decode("utf-8"))
@@ -99,10 +126,18 @@ def send_request(service, method, path, body=None):
                 return result
         except urllib.error.HTTPError as e:
             # Server answered with an error code - don't retry.
-            msg = e.read().decode("utf-8", errors="replace")
+            try:
+                if context:
+                    context.receive_headers(e.headers)
+                    context.log("HTTP_RECV", request_id, status=e.code, url=url)
+                msg = e.read().decode("utf-8", errors="replace")
+            except (ValueError, TypeError) as error:
+                return {"error": f"Invalid response metadata: {error}", "status": e.code}
+            finally:
+                e.close()
             log.info("RECV  <- %s-service %d %s", service, e.code, msg)
             return {"error": msg, "status": e.code}
-        except (UnicodeError, ValueError) as e:
+        except (UnicodeError, ValueError, TypeError) as e:
             log.error("Invalid response from %s-service: %s", service, e)
             return {"error": f"{service}-service returned invalid JSON data: {e}"}
         except (urllib.error.URLError, OSError, HTTPException) as e:
@@ -266,8 +301,10 @@ def positive_id(value):
     raise argparse.ArgumentTypeError("IDs must be positive integers")
 
 
-def main():
+def main(argv=None):
     p = argparse.ArgumentParser(description="Social Network client")
+    p.add_argument("--post-url", default=SERVICES["post"],
+                   help="Post endpoint, e.g. http://127.0.0.1:5006 (before command)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("demo")
@@ -281,7 +318,8 @@ def main():
     s = sub.add_parser("feed");          s.add_argument("user_id", type=positive_id)
     s = sub.add_parser("notifications"); s.add_argument("user_id", type=positive_id)
 
-    a = p.parse_args()
+    a = p.parse_args(argv)
+    SERVICES["post"] = a.post_url.rstrip("/")
     if a.cmd == "demo":
         try:
             return run_demo(a.author_id, a.follower_id)

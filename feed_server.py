@@ -1,5 +1,5 @@
 """
-Feed service for CECS 327 Milestone 3: P2P Integration.
+Feed service for CECS 327 Milestones 3 and 4: P2P and coordination.
 
 Feed asks Profile who the user follows, then asks Post for their posts.
 Post will use the group's four Chord storage peers to find those posts.
@@ -9,11 +9,15 @@ Feed returns the posts newest first, without duplicate post IDs.
 It allows 10 seconds per Post request for peer lookups. If a service is
 unavailable or times out, Feed returns an error instead of a partial feed.
 Post must report missing data as an error; Feed cannot spot silent omissions.
+
+Milestone 4 uses Member 1's MessageContext for HTTP and group messages.
+Vector clocks trace causality; post creation timestamps still order the feed.
 """
 
 import argparse
 import json
 import logging
+import os
 import socketserver
 import threading
 import time
@@ -28,6 +32,23 @@ from werkzeug.serving import make_server
 
 
 POST_TIMEOUT = 10  # Give Post time to look up posts through the peers.
+_process_context = None
+
+
+def process_context(node_name="feed"):
+    """Reuse one clock across HTTP, subscription, and the TCP receiver."""
+    global _process_context
+    if _process_context is None:
+        try:
+            from message_protocol import MessageContext
+        except ModuleNotFoundError as error:
+            if error.name != "message_protocol":
+                raise
+            if os.getenv("COORDINATION_ENABLED", "0") == "1":
+                raise RuntimeError("Milestone 4 requires Member 1's message_protocol.py") from error
+            return None  # Explicit Milestone 3 compatibility; no fabricated clock.
+        _process_context = MessageContext(os.getenv("NODE_NAME", node_name))
+    return _process_context
 
 
 def make_logger(name, log_dir="logs"):
@@ -70,14 +91,21 @@ class ServiceError(Exception):
         self.status = status
 
 
-def request_json(method, url, logger, request_id, body=None, timeout=2, not_found_error=None):
+def request_json(method, url, logger, request_id, body=None, timeout=2, not_found_error=None,
+                 message_context=None):
     """Call another service. Explicit serialization makes the wire format clear."""
     headers = {"Content-Type": "application/json", "X-Request-ID": request_id}
+    if message_context is not None:
+        headers = message_context.send_headers(request_id, extra=headers)
+        message_context.log("HTTP_SEND", request_id, method=method, url=url)
     wire = None if body is None else marshal(body, logger, request_id)
     logger.info("SEND %s %s request_id=%s", method, url, request_id)
     try:
         response = requests.request(method, url, data=wire, headers=headers,
                                     timeout=timeout)
+        if message_context is not None:
+            message_context.receive_headers(response.headers)
+            message_context.log("HTTP_RECV", request_id, status=response.status_code, url=url)
         logger.info("RECV status=%s request_id=%s", response.status_code, request_id)
         if response.status_code == 503:
             raise ServiceError(f"Dependency temporarily unavailable: {url}", 503)
@@ -99,7 +127,7 @@ def request_json(method, url, logger, request_id, body=None, timeout=2, not_foun
         if error.args and isinstance(error.args[0], ReadTimeoutError):
             raise ServiceError(f"Dependency timed out: {url}", 504) from error
         raise ServiceError(f"Dependency unavailable: {url}", 503) from error
-    except (requests.RequestException, ValueError) as error:
+    except (requests.RequestException, ValueError, TypeError) as error:
         raise ServiceError(f"Dependency failed or returned invalid JSON: {url}") from error
     if not isinstance(result, dict):
         raise ServiceError(f"Expected a JSON object from {url}")
@@ -127,12 +155,14 @@ def post_time(post):
 
 
 class FeedServer:
-    def __init__(self, profile_url, post_url, logger, timeout=2, demo_following=None):
+    def __init__(self, profile_url, post_url, logger, timeout=2, demo_following=None,
+                 message_context=None):
         self.profile_url = profile_url.rstrip("/")
         self.post_url = post_url.rstrip("/")
         self.logger = logger
         self.timeout = timeout
         self.demo_following = demo_following
+        self.message_context = message_context
         # Event observations are separate from authoritative feed retrieval.
         self.received_posts = {}
         self.seen_events = {}
@@ -148,7 +178,8 @@ class FeedServer:
             return self.demo_following[user_id]
         profile = request_json(
             "GET", f"{self.profile_url}/profiles/{user_id}/following",
-            self.logger, request_id, timeout=self.timeout
+            self.logger, request_id, timeout=self.timeout,
+            message_context=self.message_context
         )
         following = profile.get("following")
         if (not valid_id(profile.get("user_id")) or profile["user_id"] != user_id
@@ -165,7 +196,8 @@ class FeedServer:
             # Post will handle the Chord lookup.
             result = request_json(
                 "POST", f"{self.post_url}/posts/retrieve", self.logger,
-                request_id, {"author": author}, timeout=POST_TIMEOUT
+                request_id, {"author": author}, timeout=POST_TIMEOUT,
+                message_context=self.message_context
             )
             if result.get("success") is not True or not isinstance(result.get("posts"), list):
                 raise ServiceError("Post must return success=true and a posts list")
@@ -206,21 +238,37 @@ class FeedServer:
 
 def create_app(profile_url="http://127.0.0.1:5001",
                post_url="http://127.0.0.1:5002", log_dir="logs", timeout=2,
-               demo_following=None, node_name="feed"):
+               demo_following=None, node_name="feed", message_context=None):
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024
     logger = make_logger(node_name, log_dir)
-    feed = FeedServer(profile_url, post_url, logger, timeout, demo_following)
+    context = message_context if message_context is not None else process_context(node_name)
+    if context is None:
+        logger.info("CLOCK_DISABLED: message_protocol unavailable; Milestone 3 mode")
+    feed = FeedServer(profile_url, post_url, logger, timeout, demo_following, context)
     app.config["FEED_SERVICE"] = feed
+    app.config["MESSAGE_CONTEXT"] = context
 
     @app.before_request
     def log_request():
         g.request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        if context is not None:
+            try:
+                g.request_id = context.receive_headers(request.headers) or g.request_id
+                context.log("HTTP_RECV", g.request_id, method=request.method, path=request.path)
+            except (ValueError, TypeError) as error:
+                # A malformed incoming request ID cannot be reused by the strict
+                # response-header helper. Give this rejected request a safe ID.
+                g.request_id = str(uuid.uuid4())
+                return jsonify({"success": False, "error": f"Invalid clock metadata: {error}"}), 400
         logger.info("RECV %s %s request_id=%s", request.method, request.path, g.request_id)
 
     @app.after_request
     def log_reply(response):
         response.headers["X-Request-ID"] = g.request_id
+        if context is not None:
+            response.headers.update(context.send_headers(g.request_id))
+            context.log("HTTP_SEND", g.request_id, status=response.status_code, path=request.path)
         logger.info("SEND status=%s request_id=%s body=%s",
                     response.status_code, g.request_id, response.get_data(as_text=True))
         return response
@@ -249,6 +297,10 @@ def create_app(profile_url="http://127.0.0.1:5001",
     def receive_event():
         try:
             event = unmarshal(request.get_data(), logger, g.request_id)
+            # HTTP headers are the transport clock. Do not merge an embedded
+            # publisher clock again, or compare delivery metadata for deduplication.
+            if isinstance(event, dict):
+                event = {key: value for key, value in event.items() if key != "_meta"}
             duplicate = feed.receive_event(event)
             return jsonify({"success": True, "event_id": event["event_id"],
                             "duplicate": duplicate})
@@ -258,18 +310,23 @@ def create_app(profile_url="http://127.0.0.1:5001",
     return app
 
 
-def start_group_receiver(host, port, node_name="feed", log_dir="logs"):
+def start_group_receiver(host, port, node_name="feed", log_dir="logs", message_context=None):
     """One JSON line per TCP connection. Coordinator sends to each group member."""
     logger = make_logger(node_name, log_dir)
+    context = message_context if message_context is not None else process_context(node_name)
 
     class GroupHandler(socketserver.StreamRequestHandler):
         def handle(self):
             self.connection.settimeout(3)
+            request_id = str(uuid.uuid4())
             try:
                 line = self.rfile.readline(65537)
                 if len(line) > 65536 or not line.endswith(b"\n"):
                     raise ValueError("expected a JSON line of at most 65536 bytes")
                 message = unmarshal(line, logger, "GROUP")
+                if context is not None:
+                    message, request_id = context.receive_payload(message)
+                    context.log("GROUP_RECV", request_id)
                 if (not isinstance(message, dict)
                         or message.get("group") != "service_nodes"
                         or message.get("type") != "demo_status_request"
@@ -280,9 +337,12 @@ def start_group_receiver(host, port, node_name="feed", log_dir="logs"):
                             message["message_id"])
                 reply = {"success": True, "node": node_name,
                          "message_id": message["message_id"], "status": "ready"}
-            except (ValueError, OSError) as error:
+            except (ValueError, TypeError, OSError) as error:
                 reply = {"success": False, "node": node_name, "error": str(error)}
             try:
+                if context is not None:
+                    reply = context.send_payload(reply, request_id)
+                    context.log("GROUP_SEND", request_id)
                 self.wfile.write(marshal(reply, logger, "GROUP_REPLY") + b"\n")
             except OSError:
                 logger.warning("Group sender disconnected before the reply")
@@ -297,10 +357,11 @@ def start_group_receiver(host, port, node_name="feed", log_dir="logs"):
     return server
 
 
-def subscribe(broker_url, callback_url, logger):
+def subscribe(broker_url, callback_url, logger, message_context=None):
     """Subscribe through the existing broker API."""
     result = request_json("POST", broker_url.rstrip("/") + "/subscribe", logger,
-                          str(uuid.uuid4()), {"topic": "post.created", "url": callback_url})
+                          str(uuid.uuid4()), {"topic": "post.created", "url": callback_url},
+                          message_context=message_context)
     if result.get("success") is not True:
         raise ServiceError("Broker did not confirm subscription")
     logger.info("SUBSCRIBED topic=post.created callback=%s", callback_url)
@@ -321,7 +382,7 @@ def parse_demo_following(value):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Feed service for Milestone 3")
+    parser = argparse.ArgumentParser(description="Feed service for Milestones 3 and 4")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5003)
     parser.add_argument("--group-port", type=int, default=6003)
@@ -342,7 +403,9 @@ if __name__ == "__main__":
     callback_url = args.callback_url or f"http://127.0.0.1:{args.port}/events"
     app = create_app(args.profile_url, args.post_url, demo_following=demo_following,
                      node_name=args.node_name)
-    group_server = start_group_receiver(args.host, args.group_port, args.node_name)
+    context = app.config["MESSAGE_CONTEXT"]
+    group_server = start_group_receiver(args.host, args.group_port, args.node_name,
+                                        message_context=context)
     http_server = None
     try:
         # Start HTTP BEFORE subscription, so a broker can deliver immediately.
@@ -352,7 +415,7 @@ if __name__ == "__main__":
         http_thread.start()
         logger.info("HTTP_LISTEN %s:%s", args.host, http_server.server_port)
         if args.broker_url:
-            subscribe(args.broker_url, callback_url, logger)
+            subscribe(args.broker_url, callback_url, logger, message_context=context)
         http_thread.join()
     except KeyboardInterrupt:
         logger.info("Stopping Feed service")
