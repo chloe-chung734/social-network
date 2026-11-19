@@ -1,0 +1,31 @@
+# One local ZooKeeper server (client port 2181).
+# This demonstrates application COORDINATOR failure, not ZooKeeper server
+# fault tolerance: killing this container stops coordination by design.
+#
+#   docker compose -f compose.zookeeper.yml up -d
+#   docker compose -f compose.zookeeper.yml down        # keeps data
+#   docker compose -f compose.zookeeper.yml down -v     # WIPES data (fresh demo)
+services:
+  zookeeper:
+    image: zookeeper:3.9
+    container_name: social-network-zookeeper
+    restart: unless-stopped
+    ports:
+      - "2181:2181"
+    environment:
+      ZOO_MY_ID: 1
+      ZOO_STANDALONE_ENABLED: "true"
+      ZOO_4LW_COMMANDS_WHITELIST: "ruok,stat,mntr"
+    volumes:
+      # named volumes keep znodes (lock state!) across coordinator restarts
+      - zk-data:/data
+      - zk-datalog:/datalog
+    healthcheck:
+      test: ["CMD-SHELL", "zkServer.sh status || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  zk-data:
+  zk-datalog:
