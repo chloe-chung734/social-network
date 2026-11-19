@@ -36,7 +36,9 @@ LIMITS (see the report/README)
 
 import argparse
 import hashlib
+import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -50,6 +52,7 @@ from werkzeug.serving import make_server
 from chord_utils import (RING_SIZE, closest_preceding_finger, finger_start,
                          in_open_closed, post_routing_key)
 from peer_storage import PeerStorage
+from message_protocol import MessageContext, MessageProtocolError
 
 FINGER_COUNT = 5            # 2^5 = 32 ring positions
 MAX_HOPS = 8                # a lookup that needs more hops than this is broken
@@ -119,6 +122,12 @@ class ChordPeer:
         self.me = ref(peer_id, url)
         self.id = peer_id
         self.storage = PeerStorage(peer_id, db_dir)
+        self.message_context = MessageContext(
+            os.getenv("NODE_NAME", f"chord-peer-{peer_id}"))
+        self.coordination_enabled = os.getenv("COORDINATION_ENABLED", "0") == "1"
+        self.zk_hosts = os.getenv("ZK_HOSTS", "127.0.0.1:2181")
+        self.coord_root = "/" + os.getenv("COORD_ROOT", "/social-network/m4").strip("/")
+        self._zk_client = None
         self.log = make_logger(peer_id)
 
         # All routing state is protected by this lock.  We NEVER hold it while
@@ -151,19 +160,55 @@ class ChordPeer:
         url = peer["url"] + path
         self.info("SEND", dest=peer["id"], path=path, request_id=request_id)
         try:
+            headers = self.message_context.send_headers(request_id)
             response = requests.request(method, url, json=body, timeout=timeout,
-                                        headers={"X-Request-ID": request_id})
+                                        headers=headers)
+            self.message_context.receive_headers(response.headers,
+                                                 default_request_id=request_id)
             reply = response.json()
         except requests.RequestException as exc:
             self.info("SEND_FAILED", dest=peer["id"], path=path,
                       request_id=request_id, error=type(exc).__name__)
             raise PeerUnreachable(f"peer {peer['id']} unreachable") from exc
+        except MessageProtocolError as exc:
+            raise PeerError(f"peer {peer['id']} sent invalid clock metadata") from exc
         except ValueError as exc:
             raise PeerError(f"peer {peer['id']} sent invalid JSON") from exc
         if not response.ok or reply.get("success") is not True:
             raise PeerError(f"peer {peer['id']} {path} -> HTTP "
                             f"{response.status_code}: {reply.get('error')}")
         return reply
+
+    def grant_is_authoritative(self, grant):
+        """Fail closed unless ZooKeeper confirms this exact active grant."""
+        if not self.coordination_enabled:
+            return True
+        if not isinstance(grant, dict):
+            return False
+        try:
+            # Member 3 owns this schema and predicate. Import at runtime so
+            # Milestone 3/default-off operation has no ZooKeeper dependency.
+            from coordination_state import grant_matches
+            from kazoo.client import KazooClient
+            if self._zk_client is None:
+                self._zk_client = KazooClient(hosts=self.zk_hosts, timeout=2.0)
+                self._zk_client.start(timeout=4.0)
+            state_path = f"{self.coord_root}/locks/post-write/state"
+            self._zk_client.sync(state_path)
+            raw, _ = self._zk_client.get(state_path)
+            state = json.loads(raw.decode("utf-8"))
+            return bool(grant_matches(state, grant))
+        except Exception as exc:  # unavailable authority or schema => reject
+            self.info("WRITE_AUTHORITY_UNAVAILABLE", error=type(exc).__name__)
+            return False
+
+    def close_coordination(self):
+        if self._zk_client is not None:
+            try:
+                self._zk_client.stop()
+                self._zk_client.close()
+            finally:
+                self._zk_client = None
 
     def state_of(self, peer, request_id=None):
         return self.call(peer, "/state", method="GET", request_id=request_id)
@@ -537,13 +582,19 @@ def body():
 
 @app.before_request
 def log_request():
-    g.request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    try:
+        g.request_id = PEER.message_context.receive_headers(
+            request.headers, default_request_id=str(uuid.uuid4()))
+    except MessageProtocolError as exc:
+        g.request_id = str(uuid.uuid4())
+        PEER.info("BAD_MESSAGE_METADATA", error=str(exc))
+        return jsonify({"success": False, "error": str(exc)}), 400
     PEER.info("RECV", method=request.method, path=request.path)
 
 
 @app.after_request
 def add_request_id(response):
-    response.headers["X-Request-ID"] = g.request_id
+    response.headers.update(PEER.message_context.send_headers(g.request_id))
     return response
 
 
@@ -653,6 +704,17 @@ def records_put():
     allowed, reason = PEER.writes_allowed()
     if not allowed:
         return fail(reason, 503)
+    grant = data.get("coordination")
+    if not PEER.grant_is_authoritative(grant):
+        PEER.info("WRITE_REJECTED", record=record_id, reason="invalid_or_unavailable_grant")
+        return fail("a current authoritative post-write grant is required", 503)
+    token = grant.get("token", 0) if isinstance(grant, dict) else 0
+    if type(token) is not int or token < 0:
+        return fail("coordination grant token is invalid", 400)
+    if not PEER.coordination_enabled:
+        old_record = PEER.storage.get(record_id)
+        if old_record:
+            token = max(token, old_record.get("coordination_token", 0))
     value = data.get("value")
     if not isinstance(value, dict):
         return fail("value must be a JSON object", 400)
@@ -660,7 +722,11 @@ def records_put():
         return fail("value must be the post object with a matching id", 400)
 
     # Primary first, then the backup on my successor. Success only if both.
-    stored = PEER.storage.put(record_id, key, value, data.get("operation_id"))
+    try:
+        stored = PEER.storage.put(record_id, key, value, data.get("operation_id"), token)
+    except ValueError as exc:
+        PEER.info("WRITE_REJECTED", record=record_id, reason=str(exc))
+        return fail(str(exc), 409)
     try:
         successor = replicate(stored, g.request_id)
     except (PeerUnreachable, PeerError) as exc:
@@ -680,7 +746,22 @@ def records_delete():
     allowed, reason = PEER.writes_allowed()
     if not allowed:
         return fail(reason, 503)
-    tombstone = PEER.storage.delete(record_id, key, data.get("operation_id"))
+    grant = data.get("coordination")
+    if not PEER.grant_is_authoritative(grant):
+        PEER.info("WRITE_REJECTED", record=record_id, reason="invalid_or_unavailable_grant")
+        return fail("a current authoritative post-write grant is required", 503)
+    token = grant.get("token", 0) if isinstance(grant, dict) else 0
+    if type(token) is not int or token < 0:
+        return fail("coordination grant token is invalid", 400)
+    if not PEER.coordination_enabled:
+        old_record = PEER.storage.get(record_id)
+        if old_record:
+            token = max(token, old_record.get("coordination_token", 0))
+    try:
+        tombstone = PEER.storage.delete(record_id, key, data.get("operation_id"), token)
+    except ValueError as exc:
+        PEER.info("WRITE_REJECTED", record=record_id, reason=str(exc))
+        return fail(str(exc), 409)
     try:
         successor = replicate(tombstone, g.request_id)
     except (PeerUnreachable, PeerError) as exc:
@@ -831,6 +912,7 @@ def main():
     except KeyboardInterrupt:
         PEER.server.shutdown()
     PEER.server.server_close()
+    PEER.close_coordination()
     PEER.info("STOPPED")
 
 

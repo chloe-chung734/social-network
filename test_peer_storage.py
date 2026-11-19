@@ -46,6 +46,28 @@ class PeerStorageTests(unittest.TestCase):
         self.assertEqual(self.store.put("post:1", 17, post(1), "a")["version"], 1)
         self.assertEqual(self.store.put("post:1", 17, post(1), "b")["version"], 2)
 
+    def test_coordination_token_is_persisted_and_never_moves_backwards(self):
+        first = self.store.put("post:1", 17, post(1), "a", 4)
+        self.assertEqual(first["coordination_token"], 4)
+        self.assertEqual(PeerStorage(20, self.dir.name).get("post:1")["coordination_token"], 4)
+        stale_copy = dict(first, version=99, coordination_token=3,
+                          value=post(1, "replicated stale write"))
+        self.assertEqual(self.store.import_records([stale_copy], "backup"), (0, 1))
+        self.assertEqual(self.store.get("post:1")["value"]["content"], "x")
+        with self.assertRaises(ValueError):
+            self.store.put("post:1", 17, post(1, "stale"), "b", 3)
+        self.assertEqual(self.store.get("post:1")["value"]["content"], "x")
+        self.assertEqual(self.store.put("post:1", 17, post(1, "new"), "c", 5)
+                         ["coordination_token"], 5)
+
+    def test_coordination_token_survives_replication_and_promotion(self):
+        record = self.store.put("post:1", 17, post(1), "a", 9)
+        backup = PeerStorage(28, self.dir.name)
+        self.assertEqual(backup.import_records([record], "backup"), (1, 0))
+        self.assertEqual(backup.get("post:1")["coordination_token"], 9)
+        backup.promote_backups_to_primary()
+        self.assertEqual(backup.get("post:1")["coordination_token"], 9)
+
     def test_stale_and_repeated_imports_change_nothing(self):
         newer = dict(self.store.put("post:1", 17, post(1, "new"), "a"), version=2)
         older = dict(newer, version=1, value=post(1, "old"))

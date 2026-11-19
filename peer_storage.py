@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS peer_records (
     version      INTEGER NOT NULL,
     deleted      INTEGER NOT NULL DEFAULT 0,
     role         TEXT NOT NULL CHECK(role IN ('primary', 'backup')),
-    operation_id TEXT
+    operation_id TEXT,
+    coordination_token INTEGER NOT NULL DEFAULT 0
 )
 """
 
@@ -48,7 +49,8 @@ def _record(row):
     return {"record_id": row["record_id"], "routing_key": row["routing_key"],
             "value": None if row["value_json"] is None else json.loads(row["value_json"]),
             "version": row["version"], "deleted": bool(row["deleted"]),
-            "operation_id": row["operation_id"], "role": row["role"]}
+            "operation_id": row["operation_id"], "role": row["role"],
+            "coordination_token": row["coordination_token"]}
 
 
 class PeerStorage:
@@ -58,6 +60,10 @@ class PeerStorage:
         self.db_path = os.path.join(db_dir, f"peer_{self.peer_id}.db")
         with self._write() as conn:
             conn.execute(TABLE)
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(peer_records)")}
+            if "coordination_token" not in columns:
+                conn.execute("ALTER TABLE peer_records ADD COLUMN coordination_token "
+                             "INTEGER NOT NULL DEFAULT 0")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_key ON peer_records(routing_key)")
 
     # connections
@@ -95,35 +101,46 @@ class PeerStorage:
                             (record_id,)).fetchone()
 
     @staticmethod
-    def _save(conn, record_id, key, value_json, version, deleted, role, operation_id):
-        conn.execute("INSERT OR REPLACE INTO peer_records VALUES (?, ?, ?, ?, ?, ?, ?)",
+    def _save(conn, record_id, key, value_json, version, deleted, role, operation_id,
+              coordination_token=0):
+        conn.execute("INSERT OR REPLACE INTO peer_records "
+                     "(record_id, routing_key, value_json, version, deleted, role, "
+                     "operation_id, coordination_token) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                      (record_id, int(key), value_json, int(version), int(deleted),
-                      role, operation_id))
+                      role, operation_id, int(coordination_token)))
 
     # owner writes
 
-    def put(self, record_id, routing_key, value, operation_id=None):
+    def put(self, record_id, routing_key, value, operation_id=None,
+            coordination_token=0):
         """Owner write. New version = old + 1. The same operation_id twice is a no-op."""
         with self._write() as conn:
             old = self._find(conn, record_id)
             if old is not None and operation_id is not None \
                     and old["operation_id"] == operation_id:
                 return _record(old)
+            if old is not None and int(coordination_token) < old["coordination_token"]:
+                raise ValueError("coordination grant token is older than stored record")
             version = old["version"] + 1 if old is not None else 1
             self._save(conn, record_id, routing_key, json.dumps(value), version, 0,
-                       "primary", operation_id)
+                       "primary", operation_id,
+                       max(int(coordination_token), old["coordination_token"] if old else 0))
             return _record(self._find(conn, record_id))
 
-    def delete(self, record_id, routing_key, operation_id=None):
+    def delete(self, record_id, routing_key, operation_id=None,
+               coordination_token=0):
         """Owner delete: keep a tombstone with a higher version, never just remove."""
         with self._write() as conn:
             old = self._find(conn, record_id)
             if old is not None and old["deleted"] and operation_id is not None \
                     and old["operation_id"] == operation_id:
                 return _record(old)
+            if old is not None and int(coordination_token) < old["coordination_token"]:
+                raise ValueError("coordination grant token is older than stored record")
             version = old["version"] + 1 if old is not None else 1
             self._save(conn, record_id, routing_key, None, version, 1, "primary",
-                       operation_id)
+                       operation_id,
+                       max(int(coordination_token), old["coordination_token"] if old else 0))
             return _record(self._find(conn, record_id))
 
     def get(self, record_id):
@@ -160,13 +177,17 @@ class PeerStorage:
             for rec in records:
                 old = self._find(conn, rec["record_id"])
                 version = int(rec["version"])
+                incoming_token = int(rec.get("coordination_token", 0))
                 value_json = None if rec.get("value") is None else json.dumps(rec["value"])
-                if old is None or version > old["version"]:
+                if old is None or (version > old["version"] and
+                                   incoming_token >= old["coordination_token"]):
                     keep_primary = old is not None and old["role"] == "primary"
                     self._save(conn, rec["record_id"], rec["routing_key"], value_json,
                                version, 1 if rec.get("deleted") else 0,
                                "primary" if keep_primary else role,
-                               rec.get("operation_id"))
+                               rec.get("operation_id"),
+                               max(incoming_token,
+                                   old["coordination_token"] if old else 0))
                     applied += 1
                 elif version == old["version"] and role == "primary" \
                         and old["role"] == "backup":
