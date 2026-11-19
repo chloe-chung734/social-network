@@ -14,6 +14,21 @@ Use the TCP group ports, not the HTTP ports 5003/5006.
 
 One JSON message, including its ID, is reused for every member. Each TCP
 connection carries one newline-terminated request and one acknowledgement.
+
+MILESTONE 4: VECTOR CLOCKS (Member 6)
+The sender has ONE MessageContext (Member 1's module) for the whole run.
+Each copy actually sent to a member is its own send event, so each copy gets
+its own "_meta" envelope:
+    {"type": "demo_status_request", "group": "service_nodes",
+     "message_id": "group-demo-1",
+     "_meta": {"node_id": "group-sender:<boot>", "request_id": "group-demo-1",
+               "vector_clock": {"group-sender:<boot>": 2}}}
+Everything outside "_meta" is the unchanged Milestone 3 message. request_id
+is the message_id (or a new UUID if the message_id is not a valid request ID).
+Feed's group receiver (Member 7) merges "_meta" and answers with its own
+"_meta"; this sender merges that acknowledgement (a receive event) before
+checking it. A reply without "_meta" is accepted and logged UNTRACKED_INPUT.
+Clock events go to <log-dir>/group-sender.clock.jsonl.
 Logs are written to logs/group_sender.log and the terminal. Exit code 0 means
 every configured member acknowledged; 1 means at least one failed; 2 means
 invalid command-line options. This is a status demo, without retries, durable
@@ -25,6 +40,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import math
+import os
 from pathlib import Path
 import socket
 import time
@@ -33,6 +49,26 @@ import uuid
 
 MAX_MESSAGE_BYTES = 65536  # Includes the terminating newline, matching Feed.
 DEFAULT_MEMBERS = ["feed=127.0.0.1:6003", "feed-2=127.0.0.1:6006"]
+
+
+def make_context(log_dir, node_name="group-sender"):
+    """ONE MessageContext for this process (None only in Milestone 3 mode)."""
+    try:
+        from message_protocol import MessageContext
+    except ModuleNotFoundError as error:
+        if error.name != "message_protocol":
+            raise
+        if os.getenv("COORDINATION_ENABLED", "0") == "1":
+            raise RuntimeError("Milestone 4 requires Member 1's message_protocol.py") from error
+        return None
+    name = os.getenv("NODE_NAME", node_name)
+    return MessageContext(name, log_path=str(Path(log_dir) / f"{name}.clock.jsonl"))
+
+
+def usable_request_id(value):
+    """message_protocol's rule: 1-256 printable ASCII characters, no spaces."""
+    return (isinstance(value, str) and 0 < len(value) <= 256
+            and all(0x21 <= ord(ch) <= 0x7e for ch in value))
 
 
 def parse_member(value):
@@ -97,13 +133,32 @@ def read_acknowledgement(connection, deadline):
     return line + newline
 
 
-def send_to_member(member, wire, message_id, timeout, logger):
+def build_wire(message, logger, context, request_id):
+    """Marshal one copy. With a clock, each call is a NEW send event."""
+    if context is not None:
+        message = context.send_payload(message, request_id)   # copy + "_meta"
+    wire = marshal(message, logger)
+    if len(wire) > MAX_MESSAGE_BYTES:
+        raise ValueError("the marshalled group message is larger than 65536 bytes")
+    return message, wire
+
+
+def send_to_member(member, message, message_id, timeout, logger, context=None,
+                   request_id=None):
     """Contact one member and return its result, even if that member fails."""
     name, host, port = member
+    request_id = request_id or message_id
     result = {"node": name, "address": f"{host}:{port}", "acknowledged": False}
     logger.info("GROUP_SEND group=service_nodes message_id=%s node=%s address=%s:%s",
                 message_id, name, host, port)
     try:
+        # Build the envelope immediately before this member's send, so the
+        # send event happens once per actual transmission.
+        sent, wire = build_wire(message, logger, context, request_id)
+        if context is not None:
+            context.log("GROUP_SEND", request_id, node=name, address=f"{host}:{port}",
+                        message_id=message_id,
+                        sent_vector_clock=sent["_meta"]["vector_clock"])
         with socket.create_connection((host, port), timeout=timeout) as connection:
             # After connecting, bound the combined send/read phase. DNS lookup
             # and connection setup are separate from this deadline.
@@ -117,6 +172,12 @@ def send_to_member(member, wire, message_id, timeout, logger):
         logger.info("AFTER_UNMARSHAL node=%s message=%r", name, reply)
         if not isinstance(reply, dict):
             raise ValueError("acknowledgement must be a JSON object")
+        if context is not None:
+            # The ack arrived: one receive event, merged before checking it.
+            # receive_payload returns the reply WITHOUT "_meta"; malformed
+            # metadata raises MessageProtocolError (a ValueError) -> failure.
+            reply, _ = context.receive_payload(reply, default_request_id=request_id)
+            context.log("GROUP_RECV", request_id, node=name, message_id=message_id)
         result["reply"] = reply
         if reply.get("success") is not True:
             raise ValueError(f"node rejected the message: {reply.get('error', 'no success=true')}")
@@ -159,15 +220,25 @@ def main(argv=None):
     message_id = args.message_id if args.message_id is not None else str(uuid.uuid4())
     message = {"type": "demo_status_request", "group": "service_nodes", "message_id": message_id}
     logger = make_logger(args.log_dir)
-    wire = marshal(message, logger)  # Marshal ONCE, then reuse the same bytes for all nodes.
-    if len(wire) > MAX_MESSAGE_BYTES:
+    if len(json.dumps(message, ensure_ascii=False).encode("utf-8")) + 1 > MAX_MESSAGE_BYTES:
         parser.error("the marshalled group message is larger than 65536 bytes")
-    logger.info("GROUP_START message_id=%s members=%s", message_id, members)
+    context = make_context(args.log_dir)
+    # The operation's request ID: the message_id when it is a valid ID.
+    request_id = message_id if usable_request_id(message_id) else str(uuid.uuid4())
+    if context is not None:
+        # Starting the group operation is a local application event.
+        context.local_event("GROUP_START", request_id, message_id=message_id,
+                            members=[name for name, _, _ in members])
+    logger.info("GROUP_START message_id=%s request_id=%s members=%s",
+                message_id, request_id, members)
 
-    # Each node gets its own connection. A failure does not stop other deliveries.
+    # Each node gets its own connection and its own send event (own "_meta").
+    # The application fields are identical for every member. A failure does
+    # not stop other deliveries. All workers share the ONE process clock.
     with ThreadPoolExecutor(max_workers=min(8, len(members))) as workers:
         results = list(workers.map(
-            lambda member: send_to_member(member, wire, message_id, args.timeout, logger), members))
+            lambda member: send_to_member(member, message, message_id, args.timeout,
+                                          logger, context, request_id), members))
 
     acknowledged = sum(result["acknowledged"] for result in results)
     logger.info("GROUP_RESULTS %s", json.dumps(results, ensure_ascii=False))

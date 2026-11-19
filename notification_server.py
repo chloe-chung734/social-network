@@ -25,6 +25,22 @@ INSTALL AND START (start the broker FIRST, we subscribe once at startup)
     python broker_server.py
     python notification_server.py --broker-url http://127.0.0.1:5005
 
+MILESTONE 4: VECTOR CLOCKS (Member 6)
+    One MessageContext (Member 1's module) per process, shared by the Flask
+    threads, the startup subscriber and the Profile client.
+    * Broker delivery to POST /events: the broker's per-delivery headers are
+      merged in before_request, BEFORE the event is handled. Deduplication
+      still uses event_id only (never clock metadata), so a broker retry with
+      a new vector but the same event_id creates no extra notifications.
+    * The followers lookup to Profile is a send (fresh headers, same
+      request ID as the delivery); its reply is a receive. A timeout has no
+      receive event.
+    * Every response, errors included, carries X-Node-ID / X-Request-ID /
+      X-Vector-Clock. JSON bodies are unchanged.
+    * Untracked input (curl) is accepted and logged as UNTRACKED_INPUT;
+      malformed clock headers get HTTP 400.
+    * Clock events: logs/notification.clock.jsonl (CLOCK_LOG_DIR / NODE_NAME).
+
 LIMITS
     Notifications live in memory and are lost on restart. If the broker
     restarts, restart this server so it subscribes again.
@@ -33,6 +49,7 @@ LIMITS
 import argparse
 import json
 import logging
+import os
 import threading
 import time
 import uuid
@@ -90,6 +107,47 @@ def unmarshal(wire, label):
     message = json.loads(wire.decode("utf-8"))
     log.info("%s AFTER_UNMARSHAL %r", label, message)
     return message
+
+
+# ------------------------------------------------------------ clock context
+def process_context(node_name="notification"):
+    """Build this process's ONE MessageContext, or None in Milestone 3 mode.
+
+    With COORDINATION_ENABLED=1 a missing clock module is a startup error,
+    never a silent fallback.
+    """
+    try:
+        from message_protocol import MessageContext
+    except ModuleNotFoundError as error:
+        if error.name != "message_protocol":
+            raise
+        if os.getenv("COORDINATION_ENABLED", "0") == "1":
+            raise RuntimeError("Milestone 4 requires Member 1's message_protocol.py") from error
+        return None
+    return MessageContext(os.getenv("NODE_NAME", node_name))
+
+
+# The process clock. Code reads this global at call time, so tests can swap
+# in their own context; production code never creates a second one.
+CONTEXT = process_context()
+
+
+def clock_send_headers(request_id, base, url, method):
+    """One send event: fresh tracked headers for ONE outgoing request."""
+    if CONTEXT is None:
+        return base
+    headers = CONTEXT.send_headers(request_id, extra=base)
+    CONTEXT.log("HTTP_SEND", request_id, method=method, url=url,
+                sent_vector_clock=json.loads(headers["X-Vector-Clock"]))
+    return headers
+
+
+def clock_receive_reply(response, request_id, url):
+    """One receive event for a reply that actually arrived."""
+    if CONTEXT is None:
+        return
+    CONTEXT.receive_headers(response.headers, default_request_id=request_id)
+    CONTEXT.log("HTTP_RECV", request_id, url=url, status=response.status_code)
 
 
 def valid_id(value):
@@ -173,7 +231,11 @@ def get_followers(author_id, request_id):
     url = f"{PROFILE_URL}/profiles/{author_id}/followers"
     log.info("SEND GET %s request_id=%s", url, request_id)
     try:
-        response = requests.get(url, headers={"X-Request-ID": request_id}, timeout=2)
+        headers = clock_send_headers(request_id, {"X-Request-ID": request_id}, url, "GET")
+        response = requests.get(url, headers=headers, timeout=2)
+        # Merge Profile's reply clock before using its data. Malformed reply
+        # metadata raises MessageProtocolError (a ValueError) -> 502 below.
+        clock_receive_reply(response, request_id, url)
         log.info("RECV status=%s request_id=%s", response.status_code, request_id)
         response.raise_for_status()
         body = unmarshal(response.content, request_id)
@@ -234,12 +296,32 @@ app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024
 def log_request():
     """Keep the caller's X-Request-ID (or make one) so logs can be traced."""
     g.request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    if CONTEXT is not None:
+        try:
+            # Receive event: merge the broker's (or caller's) clock FIRST.
+            g.request_id = CONTEXT.receive_headers(request.headers)
+            CONTEXT.log("HTTP_RECV", g.request_id, method=request.method,
+                        path=request.path)
+        except ValueError as exc:               # MessageProtocolError
+            g.request_id = str(uuid.uuid4())    # the bad ID can't be echoed
+            log.warning("BAD_CLOCK_METADATA path=%s error=%s", request.path, exc)
+            return error(f"Invalid clock metadata: {exc}", 400)
     log.info("RECV %s %s request_id=%s", request.method, request.path, g.request_id)
 
 
 @app.after_request
 def log_reply(response):
+    if "request_id" not in g:
+        g.request_id = str(uuid.uuid4())
     response.headers["X-Request-ID"] = g.request_id
+    if CONTEXT is not None:
+        # Every reply is a send event, including 400/404/502 errors. The broker
+        # merges this on its side when it reads our acknowledgement.
+        sent = CONTEXT.send_headers(g.request_id)
+        response.headers.update(sent)
+        CONTEXT.log("HTTP_SEND", g.request_id, status=response.status_code,
+                    path=request.path,
+                    sent_vector_clock=json.loads(sent["X-Vector-Clock"]))
     log.info("SEND status=%s request_id=%s body=%s",
              response.status_code, g.request_id, response.get_data(as_text=True))
     return response
@@ -269,6 +351,10 @@ def receive_event():
     """
     try:
         event = unmarshal(request.get_data(), g.request_id)
+        # Headers already carried the clock. Ignore any embedded "_meta" so a
+        # body clock is never merged twice (same rule as Feed, Member 7).
+        if isinstance(event, dict) and "_meta" in event:
+            event = {key: value for key, value in event.items() if key != "_meta"}
         notes, duplicate = handle_event(event, g.request_id)
     except DependencyError as exc:
         return error(str(exc), 502)
@@ -277,6 +363,10 @@ def receive_event():
 
     log.info("EVENT_APPLIED event_id=%s created=%d duplicate=%s",
              event["event_id"], len(notes), duplicate)
+    if CONTEXT is not None:
+        # Trace line only (log() does not tick): ties event_id to this clock.
+        CONTEXT.log("EVENT_APPLIED", g.request_id, event_id=event["event_id"],
+                    topic=event.get("type"), created=len(notes), duplicate=duplicate)
     return json_reply({"success": True, "event_id": event["event_id"],
                        "duplicate": duplicate, "notifications": notes})
 
@@ -317,13 +407,18 @@ def get_notifications(user_id):
 # ---------------------------------------------------------------- startup
 def subscribe(broker_url, callback_url):
     """Register for every topic in TOPICS. Same body format Feed uses."""
+    url = broker_url.rstrip("/") + "/subscribe"
     for topic in TOPICS:
         body = {"topic": topic, "url": callback_url}
         wire = marshal(body, "SUBSCRIBE")
-        response = requests.post(broker_url.rstrip("/") + "/subscribe", data=wire,
-                                 headers={"Content-Type": "application/json",
-                                          "X-Request-ID": str(uuid.uuid4())},
-                                 timeout=2)
+        request_id = str(uuid.uuid4())         # one operation per topic
+        headers = clock_send_headers(request_id, {"Content-Type": "application/json",
+                                                  "X-Request-ID": request_id}, url, "POST")
+        response = requests.post(url, data=wire, headers=headers, timeout=2)
+        try:
+            clock_receive_reply(response, request_id, url)
+        except ValueError as exc:
+            raise RuntimeError(f"Broker reply has invalid clock metadata: {exc}") from exc
         result = unmarshal(response.content, "SUBSCRIBE_REPLY")
         if not response.ok or result.get("success") is not True:
             raise RuntimeError(f"Broker refused subscription to {topic}: {result}")

@@ -1,13 +1,51 @@
+"""Profile service (port 5001): user profiles and the follow graph.
+
+MILESTONE 4: VECTOR CLOCKS (Member 6)
+    One MessageContext (Member 1's module) per process, created at import and
+    shared by every Flask worker thread. Each incoming request is a receive
+    event, merged BEFORE the handler runs; each response, errors included, is
+    a send event with X-Node-ID / X-Request-ID / X-Vector-Clock headers.
+    JSON bodies are unchanged. Requests without clock headers (curl, older
+    callers) are still served and logged as UNTRACKED_INPUT; present but
+    malformed clock headers get HTTP 400. Clock events are written to
+    logs/profile.clock.jsonl (CLOCK_LOG_DIR changes the folder; NODE_NAME
+    changes the node name).
+"""
+
 import json
 import logging
+import os
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 
-from flask import Flask, jsonify, request
+from flask import Flask, g, jsonify, request
 
 app = Flask(__name__)
 PORT = 5001
+
+
+def process_context(node_name="profile"):
+    """Build this process's ONE MessageContext, or None in Milestone 3 mode.
+
+    COORDINATION_ENABLED=1 refuses to run without the shared clock module,
+    so the milestone demo can never silently lose clock metadata.
+    """
+    try:
+        from message_protocol import MessageContext
+    except ModuleNotFoundError as error:
+        if error.name != "message_protocol":
+            raise
+        if os.getenv("COORDINATION_ENABLED", "0") == "1":
+            raise RuntimeError("Milestone 4 requires Member 1's message_protocol.py") from error
+        return None
+    return MessageContext(os.getenv("NODE_NAME", node_name))
+
+
+# The process clock. Handlers read this global at request time, so a test may
+# swap in its own context; production code never creates a second one.
+CONTEXT = process_context()
 
 # Log timestamps in UTC.
 handler = logging.StreamHandler()
@@ -39,6 +77,11 @@ def valid_id(value):
     return type(value) is int and value > 0
 
 
+def current_request_id():
+    """The request ID chosen in before_request (falls back for safety)."""
+    return g.get("request_id") or request.headers.get("X-Request-ID", "-")
+
+
 def log_json(label, value, request_id):
     """Show the JSON data being sent or received."""
     log.info(
@@ -52,7 +95,21 @@ def log_json(label, value, request_id):
 
 @app.before_request
 def log_request():
-    request_id = request.headers.get("X-Request-ID", "-")
+    supplied = request.headers.get("X-Request-ID")
+    g.request_id = supplied or str(uuid.uuid4())
+    if CONTEXT is not None:
+        try:
+            # Receive event: merge the caller's vector BEFORE handling.
+            # Untracked input keeps its X-Request-ID (or gets a new UUID).
+            g.request_id = CONTEXT.receive_headers(request.headers)
+            CONTEXT.log("HTTP_RECV", g.request_id, method=request.method,
+                        path=request.path)
+        except ValueError as error:              # MessageProtocolError
+            g.request_id = str(uuid.uuid4())     # the bad ID can't be echoed
+            log.warning("Bad clock metadata path=%s error=%s", request.path, error)
+            return jsonify({"success": False,
+                            "error": f"Invalid clock metadata: {error}"}), 400
+    request_id = g.request_id
     log.info(
         "HTTP request method=%s path=%s request_id=%s timestamp=%s",
         request.method,
@@ -68,10 +125,19 @@ def log_request():
 @app.after_request
 def log_response(response):
     response.headers["Content-Type"] = "application/json"
+    request_id = g.get("request_id") or str(uuid.uuid4())
+    response.headers["X-Request-ID"] = request_id
+    if CONTEXT is not None:
+        # Every reply (200/201/4xx/5xx) is a send event with fresh headers.
+        sent = CONTEXT.send_headers(request_id)
+        response.headers.update(sent)
+        CONTEXT.log("HTTP_SEND", request_id, status=response.status_code,
+                    path=request.path,
+                    sent_vector_clock=json.loads(sent["X-Vector-Clock"]))
     log.info(
         "HTTP response status=%s request_id=%s body=%s",
         response.status_code,
-        request.headers.get("X-Request-ID", "-"),
+        request_id,
         response.get_data(as_text=True),
     )
     return response
@@ -109,7 +175,7 @@ def create_profile():
         _profiles[user_id] = profile
         _following.setdefault(user_id, set())
 
-    log_json("JSON marshalled response", profile, request.headers.get("X-Request-ID", "-"))
+    log_json("JSON marshalled response", profile, current_request_id())
     return jsonify(profile), 201
 
 
@@ -121,7 +187,7 @@ def read_profile(user_id):
     if profile is None:
         return jsonify({"success": False, "error": "profile not found"}), 404
 
-    log_json("JSON marshalled response", profile, request.headers.get("X-Request-ID", "-"))
+    log_json("JSON marshalled response", profile, current_request_id())
     return jsonify(profile), 200
 
 
@@ -146,7 +212,7 @@ def update_profile(user_id):
         profile = profile_from(data, user_id, existing)
         _profiles[user_id] = profile
 
-    log_json("JSON marshalled response", profile, request.headers.get("X-Request-ID", "-"))
+    log_json("JSON marshalled response", profile, current_request_id())
     return jsonify(profile), 200
 
 
@@ -164,7 +230,7 @@ def get_following(user_id):
 
     # Feed checks these fields and expects integer IDs.
     body = {"user_id": user_id, "following": authors}
-    log_json("JSON marshalled response", body, request.headers.get("X-Request-ID", "-"))
+    log_json("JSON marshalled response", body, current_request_id())
     return jsonify(body), 200
 
 @app.get("/profiles/<int:user_id>/followers")
