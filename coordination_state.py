@@ -88,7 +88,9 @@ def grant_matches(state, grant):
     holder = state.get("holder")
     if not isinstance(holder, dict):
         return False
-    token = grant.get("grant_token")
+    # Persisted state uses ``grant_token``; the Milestone 4 HTTP grant uses
+    # ``token``. Accept both forms at this shared validation boundary.
+    token = grant.get("token", grant.get("grant_token"))
     return (type(token) is int
             and token == holder.get("grant_token")
             and grant.get("owner_id") == holder.get("owner_id")

@@ -13,20 +13,20 @@ Options: --host (127.0.0.1), --zk-hosts (env ZK_HOSTS, default 127.0.0.1:2181),
 HTTP API (JSON; every request/response carries Member 1's X-Node-ID,
 X-Request-ID and X-Vector-Clock headers)
 -----------------------------------------------------------------------
-POST /lock/acquire  {"resource": "post-write", "owner_id": "...", "request_id": "..."}
+POST /locks/acquire  {"resource": "post-write", "request_id": "..."}
     owner_id defaults to the X-Node-ID header, request_id to X-Request-ID.
     200 {"success": true, "status": "granted", "grant": GRANT, ...}
     202 {"success": true, "status": "queued", "position": N, "holder": GRANT}
     409 {"success": false, "error": "request_finished", "request_status": ...}  (finished id reused)
     Re-sending the same (owner_id, request_id) is a POLL: it never enqueues twice
     and never creates a second grant. Waiters poll until they get 200.
-POST /lock/release  {"resource": "post-write", "owner_id", "request_id", "grant_token"}
+POST /locks/release  {"grant": {"resource", "owner_id", "request_id", "token", ...}}
     200 {"status": "released", "next_grant": GRANT|null}   hand-off is in the same write
     200 {"status": "released", "duplicate": true}          same grant released before
     200 {"status": "cancelled"}                            queued request withdrawn
                                                            (send "grant_token": null)
     409 {"error": "stale_release", "reason": ...}          token/owner/request mismatch
-GET  /lock/status   200 {"is_leader", "coordinator", "leader", "state": {...}}
+GET  /coordination/status   200 {"is_leader", "coordinator", "leader", "state": {...}}
                     (served by any candidate; read-only)
 GET  /health
 Non-leader or unverifiable leadership on acquire/release:
@@ -64,9 +64,13 @@ from zk_coordination import (CoordinationUnavailable, NotLeaderError,
 
 log = logging.getLogger("coordinator")
 
-ACQUIRE_PATH = "/lock/acquire"
-RELEASE_PATH = "/lock/release"
-STATUS_PATH = "/lock/status"
+# ACQUIRE_PATH = "/lock/acquire"
+# RELEASE_PATH = "/lock/release"
+# STATUS_PATH = "/lock/status"
+ACQUIRE_PATH = "/locks/acquire"
+RELEASE_PATH = "/locks/release"
+STATUS_PATH = "/coordination/status"
+
 MAX_ATTEMPTS = 8            # optimistic-concurrency retries per request
 RECOVERY_POLL = 0.5         # seconds between leadership checks for recovery
 
@@ -226,6 +230,15 @@ class LockCoordinator:
 
 # ---------------------------------------------------------------- HTTP layer
 
+def _wire_grant(grant):
+    """Expose the Milestone 4 `token` name while retaining legacy readers."""
+    if not isinstance(grant, dict):
+        return grant
+    result = dict(grant)
+    if "grant_token" in result:
+        result["token"] = result["grant_token"]
+    return result
+
 def create_app(coordinator):
     ctx, zk = coordinator.ctx, coordinator.zk
     app = Flask(__name__)
@@ -264,14 +277,34 @@ def create_app(coordinator):
         data = request.get_json(silent=True)
         if not isinstance(data, dict):
             raise ValueError("body must be a JSON object")
-        if data.get("resource", cs.RESOURCE) != cs.RESOURCE:
+        nested_grant = data.get("grant") if need_token else None
+        if nested_grant is not None and not isinstance(nested_grant, dict):
+            raise ValueError("grant must be a JSON object")
+        resource = (nested_grant.get("resource", cs.RESOURCE)
+                    if isinstance(nested_grant, dict)
+                    else data.get("resource", cs.RESOURCE))
+        if resource != cs.RESOURCE:
             raise ValueError(f"unknown resource; only {cs.RESOURCE!r} exists")
-        owner = data.get("owner_id") or request.headers.get("X-Node-ID")
-        rid = data.get("request_id") or g.request_id
+        owner = ((nested_grant.get("owner_id") if isinstance(nested_grant, dict) else None)
+                 or data.get("owner_id") or request.headers.get("X-Node-ID"))
+        rid = ((nested_grant.get("request_id") if isinstance(nested_grant, dict) else None)
+               or data.get("request_id") or g.request_id)
         cs.request_key(owner, rid)                    # validates both
-        token = data.get("grant_token")
+        if need_token:
+            token = (nested_grant.get("token", nested_grant.get("grant_token"))
+                     if isinstance(nested_grant, dict)
+                     else data.get("grant_token", data.get("token")))
+        else:
+            token = None
         if need_token and token is not None and type(token) is not int:
-            raise ValueError("grant_token must be an integer or null")
+            raise ValueError("grant token must be an integer or null")
+        header_owner = request.headers.get("X-Node-ID")
+        header_request = request.headers.get("X-Request-ID")
+        if isinstance(nested_grant, dict):
+            if header_owner and header_owner != owner:
+                raise ValueError("grant owner_id does not match X-Node-ID")
+            if header_request and header_request != rid:
+                raise ValueError("grant request_id does not match X-Request-ID")
         return owner, rid, token
 
     @app.get("/health")
@@ -279,6 +312,7 @@ def create_app(coordinator):
         return jsonify({"success": True, "service": "coordinator",
                         "node_id": ctx.node_id, "is_leader": zk.is_leader()})
 
+    @app.post("/lock/acquire")  # legacy alias for the same endpoint
     @app.post(ACQUIRE_PATH)
     def acquire():
         try:
@@ -294,17 +328,18 @@ def create_app(coordinator):
         base = {"coordinator": ctx.node_id, "coordinator_generation": zk.generation,
                 "owner_id": owner, "request_id": rid}
         if result["outcome"] == "granted":
-            return jsonify({"success": True, "status": "granted", "grant": result["grant"],
+            return jsonify({"success": True, "status": "granted", "grant": _wire_grant(result["grant"]),
                             "duplicate": result["duplicate"], **base}), 200
         if result["outcome"] == "queued":
             return jsonify({"success": True, "status": "queued", "position": result["position"],
-                            "holder": result["holder"], "duplicate": result["duplicate"],
+                            "holder": _wire_grant(result["holder"]), "duplicate": result["duplicate"],
                             **base}), 202
         return fail("request_finished", 409, request_status=result["status"],
                     grant_token=result.get("grant_token"),
                     detail="this request_id was already released or cancelled; use a new one",
                     **base)
 
+    @app.post("/lock/release")  # legacy alias for the same endpoint
     @app.post(RELEASE_PATH)
     def release():
         try:
@@ -318,11 +353,11 @@ def create_app(coordinator):
         except (CoordinationUnavailable, cs.StateError) as exc:
             return fail("coordination_unavailable", 503, detail=str(exc))
         base = {"coordinator": ctx.node_id, "owner_id": owner, "request_id": rid,
-                "grant_token": token}
+                "grant_token": token, "token": token}
         outcome = result["outcome"]
         if outcome == "released":
             return jsonify({"success": True, "status": "released", "duplicate": False,
-                            "next_grant": result["next_grant"], **base}), 200
+                            "next_grant": _wire_grant(result["next_grant"]), **base}), 200
         if outcome == "duplicate":
             return jsonify({"success": True, "status": "released", "duplicate": True,
                             **base}), 200
@@ -330,6 +365,7 @@ def create_app(coordinator):
             return jsonify({"success": True, "status": "cancelled", **base}), 200
         return fail("stale_release", 409, reason=result["reason"], **base)
 
+    @app.get("/lock/status")  # legacy alias for the same endpoint
     @app.get(STATUS_PATH)
     def status():
         try:

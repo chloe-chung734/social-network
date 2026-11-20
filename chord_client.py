@@ -29,14 +29,19 @@ class ChordTimeout(ChordError):
     """The shared operation deadline expired."""
 
 
+class ChordOutcomeUnknown(ChordError):
+    """A mutation may have reached storage, but its result was not confirmed."""
+
+
 class ChordClient:
     """Route each record operation through an entry peer and its lookup API."""
 
-    def __init__(self, entry_peer=None, timeout=2.0):
+    def __init__(self, entry_peer=None, timeout=2.0, message_context=None):
         self.entry_peer = (entry_peer or os.getenv(
             "CHORD_ENTRY_PEER", DEFAULT_ENTRY_PEER)).rstrip("/")
         self.timeout = float(timeout)
         self.session = requests.Session()
+        self.message_context = message_context
 
     @staticmethod
     def routing_key(post_id):
@@ -44,31 +49,60 @@ class ChordClient:
         digest = hashlib.sha256(str(post_id).encode("ascii")).digest()
         return int.from_bytes(digest, "big") % RING_SIZE
 
-    def _post(self, base, path, body, request_id, deadline=None):
+    def _post(self, base, path, body, request_id, deadline=None, *, mutation=False):
         remaining = self.timeout if deadline is None else deadline - time.monotonic()
         if remaining <= 0:
             raise ChordTimeout("Chord operation deadline expired")
+        headers = (self.message_context.send_headers(request_id)
+                   if self.message_context is not None
+                   else {"X-Request-ID": request_id})
         try:
             response = self.session.post(
                 urljoin(base.rstrip("/") + "/", path.lstrip("/")),
                 json=body,
-                headers={"X-Request-ID": request_id},
+                headers=headers,
                 timeout=max(0.05, min(self.timeout, remaining)),
             )
         except requests.Timeout as exc:
+            if mutation:
+                raise ChordOutcomeUnknown(str(exc)) from exc
             raise ChordTimeout(str(exc)) from exc
         except requests.RequestException as exc:
+            if mutation:
+                raise ChordOutcomeUnknown(str(exc)) from exc
             raise ChordUnavailable(str(exc)) from exc
+        if self.message_context is not None:
+            try:
+                response_request_id = self.message_context.receive_headers(response.headers)
+            except Exception as exc:
+                if mutation:
+                    raise ChordOutcomeUnknown(
+                        "mutation reply metadata invalid; outcome is unknown") from exc
+                raise ChordUnavailable("peer returned invalid message metadata: %s" % exc) from exc
+            if response_request_id != request_id:
+                if mutation:
+                    raise ChordOutcomeUnknown(
+                        "mutation reply correlation ID did not match request")
+                raise ChordUnavailable("peer reply correlation ID did not match request")
         if response.status_code == 404 and path == "/records/get":
             return {"success": True, "found": False}
         if response.status_code >= 500:
+            if mutation:
+                raise ChordOutcomeUnknown(
+                    "peer returned HTTP %s: %s" % (response.status_code, response.text))
             raise ChordUnavailable(
                 "peer returned HTTP %s: %s" % (response.status_code, response.text))
         try:
             result = response.json()
         except ValueError as exc:
+            if mutation and response.ok:
+                raise ChordOutcomeUnknown(
+                    "peer accepted mutation but returned invalid JSON") from exc
             raise ChordUnavailable("peer returned invalid JSON") from exc
         if not response.ok or not isinstance(result, dict) or result.get("success") is not True:
+            if mutation and response.ok:
+                raise ChordOutcomeUnknown(
+                    "peer accepted mutation but returned an invalid success reply")
             raise ChordUnavailable("peer rejected request: %s" % result)
         return result
 
@@ -94,16 +128,26 @@ class ChordClient:
             raise ChordUnavailable("record response has no record")
         return result["record"]
 
-    def put(self, record_id, routing_key, value, request_id, deadline=None):
+    def put(self, record_id, routing_key, value, request_id, deadline=None,
+            coordination=None):
         owner = self.lookup(routing_key, request_id, deadline)
-        return self._post(owner["url"], "/records/put", {
+        body = {
             "record_id": str(record_id), "routing_key": routing_key,
             "value": value, "operation_id": request_id,
-        }, request_id, deadline)
+        }
+        if coordination is not None:
+            body["coordination"] = coordination
+        return self._post(owner["url"], "/records/put", body,
+                          request_id, deadline, mutation=True)
 
-    def delete(self, record_id, routing_key, request_id, deadline=None):
+    def delete(self, record_id, routing_key, request_id, deadline=None,
+               coordination=None):
         owner = self.lookup(routing_key, request_id, deadline)
-        return self._post(owner["url"], "/records/delete", {
+        body = {
             "record_id": str(record_id), "routing_key": routing_key,
             "operation_id": request_id,
-        }, request_id, deadline)
+        }
+        if coordination is not None:
+            body["coordination"] = coordination
+        return self._post(owner["url"], "/records/delete", body,
+                          request_id, deadline, mutation=True)
