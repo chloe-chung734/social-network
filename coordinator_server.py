@@ -26,7 +26,7 @@ POST /lock/release  {"resource": "post-write", "owner_id", "request_id", "grant_
     200 {"status": "cancelled"}                            queued request withdrawn
                                                            (send "grant_token": null)
     409 {"error": "stale_release", "reason": ...}          token/owner/request mismatch
-GET  /lock/status   200 {"is_leader", "coordinator", "leader", "state": {...}}
+GET  /coordination/status  200 {"is_leader", "coordinator", "leader", "state": {...}}
                     (served by any candidate; read-only)
 GET  /health
 Non-leader or unverifiable leadership on acquire/release:
@@ -66,7 +66,7 @@ log = logging.getLogger("coordinator")
 
 ACQUIRE_PATH = "/lock/acquire"
 RELEASE_PATH = "/lock/release"
-STATUS_PATH = "/lock/status"
+STATUS_PATH = "/coordination/status"
 MAX_ATTEMPTS = 8            # optimistic-concurrency retries per request
 RECOVERY_POLL = 0.5         # seconds between leadership checks for recovery
 
