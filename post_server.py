@@ -7,22 +7,27 @@ import os
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import requests
-from flask import Flask, g, jsonify, request
+from flask import Flask, current_app, g, jsonify, request
 from werkzeug.serving import make_server
 
-from chord_client import ChordClient, ChordError, ChordTimeout, ChordUnavailable
+from chord_client import (ChordClient, ChordError, ChordOutcomeUnknown,
+                          ChordTimeout, ChordUnavailable)
+from message_protocol import MessageContext, MessageProtocolError
 
 
 DEFAULT_BROKER_URL = "http://127.0.0.1:5005"
 AUTHOR_BUDGET_SECONDS = 7.0
+_message_context = None
 _client = ChordClient()
 # Every read-modify-write of Chord records (ID counter, author index, likes,
 # comments) runs under this lock. Flask is threaded, and without it two
 # requests can read the same counter or post and overwrite each other.
-# This assumes ONE Post process, as chord_contract.md does.
+# This serializes this process; the ZooKeeper-backed grant serializes all Post
+# processes when coordination mode is enabled.
 _write_lock = threading.Lock()
 
 app = Flask(__name__)
@@ -53,7 +58,123 @@ def valid_id(value):
 
 
 def error_response(message, status):
+    grant = getattr(g, "coordination_grant", None)
+    if status >= 400 and grant is not None and not getattr(g, "write_rejected_logged", False):
+        _context().log("WRITE_REJECTED", g.request_id, resource="post-write",
+                       grant_token=grant.get("token"), status=status)
+        g.write_rejected_logged = True
     return jsonify({"success": False, "error": message}), status
+
+
+def process_context():
+    """Return this process's single shared clock and message identity."""
+    global _message_context
+    if _message_context is None:
+        node_name = os.getenv("NODE_NAME")
+        if not node_name:
+            node_name = "post-b" if os.getenv("POST_PORT", "5002") == "5006" else "post-a"
+        _message_context = MessageContext(node_name)
+    return _message_context
+
+
+_UNSET = object()
+
+
+def create_app(*, message_context=None, chord_client=None,
+               coordination_client=_UNSET):
+    """Configure the Post Flask app, sharing one context with helper clients.
+
+    Coordination is off by default for Milestone 3. If enabled, failure to
+    initialize the discovery client is fatal; there is no local-lock fallback.
+    """
+    global _client
+    ctx = message_context or process_context()
+    client = chord_client or ChordClient(message_context=ctx)
+    client.message_context = ctx
+    enabled = os.getenv("COORDINATION_ENABLED", "0") == "1"
+    if coordination_client is _UNSET:
+        coord = None
+        if enabled:
+            try:
+                from coordination_client import CoordinationClient
+                coord = CoordinationClient(
+                    ctx, hosts=os.getenv("ZK_HOSTS", "127.0.0.1:2181"),
+                    root=os.getenv("COORD_ROOT", "/social-network/m4"))
+            except Exception as exc:
+                raise RuntimeError(
+                    "COORDINATION_ENABLED=1 but coordinator discovery failed: %s" % exc
+                ) from exc
+    else:
+        coord = coordination_client
+    if enabled and coord is None:
+        raise RuntimeError("COORDINATION_ENABLED=1 requires distributed coordination")
+    _client = client
+    app.extensions["message_context"] = ctx
+    app.extensions["chord_client"] = client
+    app.extensions["coordination_client"] = coord
+    return app
+
+
+def _context():
+    return current_app.extensions["message_context"]
+
+
+def _chord():
+    return current_app.extensions["chord_client"]
+
+
+def _coordination():
+    return current_app.extensions.get("coordination_client")
+
+
+def _local_event(event, **fields):
+    return _context().local_event(event, g.request_id, **fields)
+
+
+@contextmanager
+def protected_write_scope():
+    """Hold the global grant and local lock for one complete mutation."""
+    coord = _coordination()
+    grant = None
+    if coord is not None:
+        try:
+            grant = coord.acquire("post-write", g.request_id)
+        except Exception as exc:
+            _context().log("WRITE_REJECTED", g.request_id, resource="post-write",
+                           reason="coordination_unavailable")
+            raise RuntimeError("distributed coordination unavailable: %s" % exc) from exc
+        g.coordination_grant = grant
+        g.unresolved_write = False
+        _local_event("CS_ENTER", resource="post-write", grant_token=grant["token"])
+    _write_lock.acquire()
+    try:
+        yield grant
+    finally:
+        _write_lock.release()
+        if coord is not None and grant is not None:
+            if getattr(g, "unresolved_write", False):
+                _context().log("WRITE_UNRESOLVED", g.request_id,
+                               resource="post-write", grant_token=grant["token"])
+            else:
+                _local_event("CS_EXIT", resource="post-write",
+                             grant_token=grant["token"])
+                try:
+                    coord.release(grant)
+                except Exception as exc:
+                    # The durable holder remains occupied if release is not
+                    # confirmed; a later call can safely retry this grant.
+                    _context().log("LOCK_RELEASE_PENDING", g.request_id,
+                                   resource="post-write", grant_token=grant["token"],
+                                   error=str(exc))
+                    log.warning("LOCK_RELEASE_PENDING request_id=%s token=%s error=%s",
+                                g.request_id, grant.get("token"), exc)
+
+
+@app.errorhandler(RuntimeError)
+def handle_runtime_error(exc):
+    if "distributed coordination unavailable" in str(exc):
+        return error_response("Coordination unavailable", 503)
+    raise exc
 
 
 def marshal(message, label):
@@ -74,13 +195,21 @@ def read_json_object():
 
 @app.before_request
 def log_request():
-    g.request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    ctx = app.extensions.get("message_context") or process_context()
+    app.extensions.setdefault("message_context", ctx)
+    try:
+        g.request_id = ctx.receive_headers(request.headers)
+    except MessageProtocolError as exc:
+        g.request_id = str(uuid.uuid4())
+        g.message_metadata_error = True
+        return error_response(str(exc), 400)
     log.info("RECV %s %s request_id=%s", request.method, request.path, g.request_id)
 
 
 @app.after_request
 def log_reply(response):
-    response.headers["X-Request-ID"] = g.request_id
+    ctx = app.extensions.get("message_context") or process_context()
+    response.headers.update(ctx.send_headers(g.request_id))
     log.info("SEND status=%s request_id=%s", response.status_code, g.request_id)
     return response
 
@@ -94,7 +223,7 @@ def key_for(record_id):
 
 
 def load_record(record_id, deadline=None):
-    value = _client.get(record_id, key_for(record_id), g.request_id, deadline)
+    value = _chord().get(record_id, key_for(record_id), g.request_id, deadline)
     if value is None:
         return None
     # The agreed value is the stored application JSON object.
@@ -102,17 +231,28 @@ def load_record(record_id, deadline=None):
 
 
 def save_record(record_id, value, suffix="write", deadline=None):
-    return _client.put(record_id, key_for(record_id), value,
-                       "%s:%s" % (g.request_id, suffix), deadline)
+    return _chord().put(record_id, key_for(record_id), value,
+                        "%s:%s" % (g.request_id, suffix), deadline,
+                        coordination=getattr(g, "coordination_grant", None))
 
 
 def delete_record(record_id, suffix="delete", deadline=None):
-    return _client.delete(record_id, key_for(record_id),
-                          "%s:%s" % (g.request_id, suffix), deadline)
+    return _chord().delete(record_id, key_for(record_id),
+                           "%s:%s" % (g.request_id, suffix), deadline,
+                           coordination=getattr(g, "coordination_grant", None))
 
 
 def storage_error(exc):
     log.warning("CHORD_FAILURE request_id=%s error=%s", g.request_id, exc)
+    if isinstance(exc, ChordOutcomeUnknown):
+        g.unresolved_write = True
+        if not getattr(g, "write_rejected_logged", False):
+            _context().log("WRITE_REJECTED", g.request_id, resource="post-write",
+                           reason="storage_outcome_unknown")
+            g.write_rejected_logged = True
+        return error_response("Storage outcome is unknown; operation was not replayed", 504)
+    _context().log("WRITE_REJECTED", g.request_id, resource="post-write",
+                   reason="storage_failure")
     if isinstance(exc, ChordTimeout):
         return error_response("Chord storage timed out", 504)
     return error_response("Chord storage unavailable", 503)
@@ -121,9 +261,11 @@ def storage_error(exc):
 def publish_event(event):
     event["event_id"] = str(uuid.uuid4())
     try:
+        headers = _context().send_headers(g.request_id)
         response = requests.post(
             os.getenv("BROKER_URL", DEFAULT_BROKER_URL).rstrip("/") + "/publish",
-            json=event, headers={"X-Request-ID": g.request_id}, timeout=3.0)
+            json=event, headers=headers, timeout=3.0)
+        _context().receive_headers(response.headers)
         response.raise_for_status()
         result = response.json()
         return result.get("all_delivered") is True, result
@@ -139,6 +281,13 @@ def get_post(post_id, deadline=None):
 
 def update_post(post, suffix):
     save_record("post:%d" % post["id"], post, suffix)
+
+
+def mark_write_complete():
+    if _coordination() is not None:
+        grant = g.coordination_grant
+        _local_event("WRITE_COMPLETE", resource="post-write",
+                     grant_token=grant["token"])
 
 
 def get_author_index(author, deadline=None):
@@ -169,7 +318,7 @@ def create_post():
     if not isinstance(content, str) or not isinstance(caption, str):
         return error_response("content and caption must be strings", 400)
 
-    with _write_lock:
+    with protected_write_scope():
         try:
             counter_id = "meta:next_post_id"
             counter = load_record(counter_id)
@@ -186,10 +335,15 @@ def create_post():
                 index = get_author_index(author)
                 index["post_ids"] = sorted(set(index["post_ids"] + [post_id]))
                 save_record("author:%d" % author, index, "author-index")
+                mark_write_complete()
+            except ChordOutcomeUnknown:
+                raise
             except ChordError:
                 # Best-effort compensation; the ID remains consumed.
                 try:
                     delete_record("post:%d" % post_id, "compensate-post")
+                except ChordOutcomeUnknown:
+                    raise
                 except ChordError:
                     pass
                 raise
@@ -237,7 +391,7 @@ def retrieve_posts():
 
 @app.delete("/posts/<int:post_id>")
 def delete_post(post_id):
-    with _write_lock:
+    with protected_write_scope():
         try:
             post = get_post(post_id)
             if post is None:
@@ -246,6 +400,7 @@ def delete_post(post_id):
             index = get_author_index(post["author"])
             index["post_ids"] = [item for item in index["post_ids"] if item != post_id]
             save_record("author:%d" % post["author"], index, "delete-index")
+            mark_write_complete()
         except ChordError as exc:
             return storage_error(exc)
     return jsonify({"success": True, "deleted_post": post}), 200
@@ -262,7 +417,7 @@ def create_comment(post_id):
         return error_response("author must be a positive integer", 400)
     if not isinstance(content, str) or not content:
         return error_response("content must be a nonempty string", 400)
-    with _write_lock:
+    with protected_write_scope():
         try:
             post = get_post(post_id)
             if post is None:
@@ -274,6 +429,7 @@ def create_comment(post_id):
             comment = {"id": next_id, "author": author, "content": content}
             post.setdefault("comments", []).append(comment)
             update_post(post, "comment")
+            mark_write_complete()
         except ChordError as exc:
             return storage_error(exc)
     reply = {"success": True, "comment": comment, "post": post}
@@ -290,7 +446,7 @@ def create_comment(post_id):
 
 @app.delete("/posts/<int:post_id>/comments/<int:comment_id>")
 def delete_comment(post_id, comment_id):
-    with _write_lock:
+    with protected_write_scope():
         try:
             post = get_post(post_id)
             if post is None:
@@ -301,6 +457,7 @@ def delete_comment(post_id, comment_id):
                 return error_response("Comment not found", 404)
             post["comments"].remove(comment)
             update_post(post, "delete-comment")
+            mark_write_complete()
         except ChordError as exc:
             return storage_error(exc)
     return jsonify({"success": True, "deleted_comment": comment, "post": post}), 200
@@ -315,7 +472,7 @@ def like_post(post_id):
     user_id = data.get("user_id")
     if not valid_id(user_id):
         return error_response("user_id must be a positive integer", 400)
-    with _write_lock:
+    with protected_write_scope():
         try:
             post = get_post(post_id)
             if post is None:
@@ -324,6 +481,7 @@ def like_post(post_id):
                 return error_response("User has already liked this post", 409)
             post.setdefault("likes", []).append(user_id)
             update_post(post, "like")
+            mark_write_complete()
         except ChordError as exc:
             return storage_error(exc)
     reply = {"success": True, "message": "Post liked successfully", "post": post}
@@ -346,7 +504,7 @@ def unlike_post(post_id):
     user_id = data.get("user_id")
     if not valid_id(user_id):
         return error_response("user_id must be a positive integer", 400)
-    with _write_lock:
+    with protected_write_scope():
         try:
             post = get_post(post_id)
             if post is None:
@@ -355,10 +513,14 @@ def unlike_post(post_id):
                 return error_response("User has not liked this post", 404)
             post["likes"].remove(user_id)
             update_post(post, "unlike")
+            mark_write_complete()
         except ChordError as exc:
             return storage_error(exc)
     return jsonify({"success": True, "message": "Like removed successfully",
                     "post": post}), 200
+
+
+create_app()
 
 
 if __name__ == "__main__":
@@ -372,3 +534,6 @@ if __name__ == "__main__":
         log.info("Stopping Post service")
     finally:
         server.server_close()
+        coord = app.extensions.get("coordination_client")
+        if coord is not None:
+            coord.close()

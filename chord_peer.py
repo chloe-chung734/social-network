@@ -708,7 +708,7 @@ def records_put():
     if not PEER.grant_is_authoritative(grant):
         PEER.info("WRITE_REJECTED", record=record_id, reason="invalid_or_unavailable_grant")
         return fail("a current authoritative post-write grant is required", 503)
-    token = grant.get("token", 0) if isinstance(grant, dict) else 0
+    token = grant.get("token", grant.get("grant_token", 0)) if isinstance(grant, dict) else 0
     if type(token) is not int or token < 0:
         return fail("coordination grant token is invalid", 400)
     if not PEER.coordination_enabled:
@@ -750,7 +750,7 @@ def records_delete():
     if not PEER.grant_is_authoritative(grant):
         PEER.info("WRITE_REJECTED", record=record_id, reason="invalid_or_unavailable_grant")
         return fail("a current authoritative post-write grant is required", 503)
-    token = grant.get("token", 0) if isinstance(grant, dict) else 0
+    token = grant.get("token", grant.get("grant_token", 0)) if isinstance(grant, dict) else 0
     if type(token) is not int or token < 0:
         return fail("coordination grant token is invalid", 400)
     if not PEER.coordination_enabled:
