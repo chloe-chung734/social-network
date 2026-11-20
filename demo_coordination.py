@@ -147,7 +147,7 @@ class Wire:
 
 def discovery(context):
     from zk_coordination import ZKCoordination
-    service = ZKCoordination(context.node_id, context.clock,
+    service = ZKCoordination(context.node_id, context,
                              hosts=os.environ["ZK_HOSTS"], root=os.environ["COORD_ROOT"])
     service.start()
     return service
@@ -241,6 +241,7 @@ def run_demo(runs_dir=None, hosts="127.0.0.1:2181"):
     preflight()
     from message_protocol import MessageContext
     from kazoo.client import KazooClient
+    from coordination_state import grant_matches
     cluster = make_cluster(runs_dir or REPO / "coordination_runs", hosts)
     previous_cwd = Path.cwd()
     previous_env = {key: os.environ.get(key) for key in ("ZK_HOSTS", "COORD_ROOT")}
@@ -263,9 +264,10 @@ def run_demo(runs_dir=None, hosts="127.0.0.1:2181"):
             cluster.wait_http(label, f"http://127.0.0.1:{port}/coordination/status")
         service = discovery(context)
         leader = wait_for("ready elected leader", service.leader_info)
-        roles = [wire.ok("GET", f"http://127.0.0.1:{p}/coordination/status")["role"]
+        leaders = [wire.ok("GET", f"http://127.0.0.1:{p}/coordination/status")["is_leader"]
                  for p in (5101, 5102, 5103)]
-        require(roles.count("leader") == 1, f"Expected one leader, got roles {roles}")
+        require(all(type(value) is bool for value in leaders) and sum(leaders) == 1,
+                f"Expected one leader, got is_leader flags {leaders}")
         summary["checks"].append("one elected leader")
 
         cluster.start_ring()
@@ -319,13 +321,13 @@ def run_demo(runs_dir=None, hosts="127.0.0.1:2181"):
             if not current:
                 return None
             try:
-                return wire.ok("GET", current["url"] + "/coordination/status")
+                return wire.ok("GET", current["url"] + "/coordination/status")["state"]
             except requests.RequestException:
                 return None
 
         def queued(ids):
             state = lock_status()
-            return state and set(ids) <= {item["request_id"] for item in state["waiting"]}
+            return state and set(ids) <= {item["request_id"] for item in state["queue"]}
 
         def contention_round(number, failover=False):
             hold_rid = f"round-{number}-holder"
@@ -345,7 +347,7 @@ def run_demo(runs_dir=None, hosts="127.0.0.1:2181"):
             common_gate.touch()
             wait_for("both Post instances queued", lambda: queued(ids), 25)
             state = lock_status()
-            require(state["holder"] == original_grant, "Queued requests replaced existing holder")
+            require(grant_matches(state, original_grant), "Queued requests replaced existing holder")
             if failover:
                 old = service.leader_info()
                 label = next((name for name in cluster.procs if old["node_id"].startswith(name + ":")), None)
@@ -357,8 +359,8 @@ def run_demo(runs_dir=None, hosts="127.0.0.1:2181"):
                 new = wait_for("replacement coordinator", replacement, 60)
                 require(new["generation"] > old["generation"], "Leader generation did not advance")
                 state = lock_status()
-                require(state and state["holder"] == original_grant, "Replacement lost the active grant")
-                require(set(ids) <= {item["request_id"] for item in state["waiting"]},
+                require(state and grant_matches(state, original_grant), "Replacement lost the active grant")
+                require(set(ids) <= {item["request_id"] for item in state["queue"]},
                         "Replacement lost waiting requests")
                 for name, _ in jobs:
                     require(cluster.procs[name].poll() is None, "Waiter finished before holder released")
